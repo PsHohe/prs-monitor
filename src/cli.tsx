@@ -24,6 +24,7 @@ Options:
   --all     Every repo involving you, not only the current one
   --json    Print the snapshot as JSON
   --fetch   (status) Ask GitHub when the cache is older than the poll interval
+  --color   Color the output even when it is not a terminal (e.g. a status line)
   -h, --help`
 
 const { values, positionals } = parseArgs({
@@ -32,9 +33,13 @@ const { values, positionals } = parseArgs({
     all: { type: 'boolean', default: false },
     json: { type: 'boolean', default: false },
     fetch: { type: 'boolean', default: false },
+    color: { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h', default: false },
   },
 })
+
+const isColored = values.color || !!process.stdout.isTTY
+const ANSI: Record<NonNullable<Chip['color']>, number> = { error: 31, warning: 33, success: 32, merged: 35 }
 
 const command = positionals[0] ?? (process.stdout.isTTY && process.stdin.isTTY ? 'view' : 'list')
 if (values.help || !['view', 'list', 'status', 'report'].includes(command)) {
@@ -94,10 +99,16 @@ if (values.json) {
   printList(snapshot)
 }
 
+function paint(chip: Chip): string {
+  const code = chip.color ? ANSI[chip.color] : chip.dim ? 2 : null
+
+  return isColored && code ? `\x1b[${code}m${chip.text}\x1b[0m` : chip.text
+}
+
 function chips(pr: PrRow): string {
   const all: Chip[] = [reviewChip(pr), ciChip(pr), ...(pr.unresolved ? [threadsChip(pr)] : []), ...extraChips(pr)]
 
-  return all.map(one => one.text).join('  ')
+  return all.map(paint).join('  ')
 }
 
 function statusLine(snap: Snapshot): string {
@@ -108,7 +119,8 @@ function statusLine(snap: Snapshot): string {
   const alert = alertOf(snap.current, snap.rows, Date.now())
   if (alert) {
     const more = alert.more > 0 ? ` +${alert.more}` : ''
-    parts.push(`${alert.kind === 'new' ? '●' : '✓'} #${alert.pr.number} ${alert.text}${more}`)
+    const color = alert.kind === 'new' ? 'warning' : 'success'
+    parts.push(paint({ text: `${alert.kind === 'new' ? '●' : '✓'} #${alert.pr.number} ${alert.text}${more}`, color }))
   }
 
   return parts.join(' │ ')

@@ -66,6 +66,8 @@ export async function quickReport(
         maxTurns: 1,
         includePartialMessages: true,
         cwd: tmpdir(),
+        // The installed CLI, so a compiled prs works without the SDK's bundled copy.
+        pathToClaudeCodeExecutable: Bun.which('claude') ?? undefined,
         abortController,
       },
     })
