@@ -3,15 +3,32 @@ import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 
 import type { PrBucket, PrRow } from '../types'
-import { copy, notify, openUrl, promptFor, reviewLabel } from '../actions'
-import { quickReport } from '../ai'
+import { copy, localOffset, notify, openUrl, promptFor, reviewLabel } from '../actions'
 import type { Action } from '../actions'
-import { readState, run, updateState } from '../github'
-import { age, ago, bucketOf, ciChip, detailOf, extraChips, reviewChip, rowKey, threadsChip } from '../lib/lib'
+import { digest, quickReport } from '../ai'
+import type { ReportResult } from '../ai'
+import { checkoutPr, fetchChanges, mergePr, readState, rerequestReview, run, updateBranch, updateState } from '../github'
+import type { CliState, Done } from '../github'
+import {
+  age,
+  ago,
+  bucketOf,
+  changesMarkdown,
+  ciChip,
+  detailOf,
+  extraChips,
+  rerequestable,
+  reviewChip,
+  rowKey,
+  staleness,
+  threadsChip,
+  tomorrowMorning,
+} from '../lib/lib'
 import type { Chip } from '../lib/lib'
 import { configFor, loadConfigs, refresh, sortRows } from '../monitor'
 import type { Configs, RefreshOptions, Scope, Snapshot } from '../monitor'
 import { markdownLines } from './markdown'
+import { Panel } from './Panel'
 
 const TICK_MS = 60 * 1000
 const SPIN_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
@@ -19,39 +36,48 @@ const BUCKETS: { bucket: PrBucket; title: string; color?: string }[] = [
   { bucket: 'me', title: 'WAITING ON ME', color: 'yellow' },
   { bucket: 'ready', title: 'READY TO MERGE', color: 'green' },
   { bucket: 'others', title: 'WAITING ON OTHERS' },
+  { bucket: 'snoozed', title: 'SNOOZED' },
 ]
 const COLORS: Record<NonNullable<Chip['color']>, string> = { error: 'red', warning: 'yellow', success: 'green', merged: 'magenta' }
+const MERGE_WORDS = { merge: 'a merge commit', squash: 'squash', rebase: 'rebase' } as const
 
 type Flash = { text: string; isError?: boolean }
 // One terminal line; `item` is the selectable item it belongs to.
 type Line = { key: string; item?: string; node: ReactNode }
 type Item = { key: string; pr?: PrRow; bucket?: PrBucket }
-type Report = { pr: PrRow; status: 'loading' | 'done' | 'error'; text: string; at: number }
+// A full-screen text view over the list: a PR's report, what changed since my review, or the digest.
+type PanelKind = 'report' | 'changes' | 'digest'
+type PanelState = { kind: PanelKind; pr: PrRow | null; status: 'loading' | 'done' | 'error'; text: string; at: number }
+// A GitHub action waiting for y.
+type Confirm = { text: string; run: () => Promise<Done> }
 
-type Props = { initialScope: Scope; initialConfigs: Configs; initialSeen: Record<string, string>; initialCollapsed: string[] }
+type Props = { initialScope: Scope; initialConfigs: Configs; initialState: CliState }
 
-export function App({ initialScope, initialConfigs, initialSeen, initialCollapsed }: Props) {
+export function App({ initialScope, initialConfigs, initialState }: Props) {
   const { exit } = useApp()
   const { columns, rows: height } = useWindowSize()
   const [snap, setSnap] = useState<Snapshot | null>(null)
   const [frame, setFrame] = useState<number | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
-  const [collapsed, setCollapsed] = useState(initialCollapsed)
+  const [collapsed, setCollapsed] = useState(initialState.collapsed)
   const [flash, setFlash] = useState<Flash | null>(null)
   const [now, setNow] = useState(Date.now())
-  const [report, setReport] = useState<Report | null>(null)
-  const [isReportOpen, setReportOpen] = useState(false)
-  const [reportTop, setReportTop] = useState(0)
-  const reportAbort = useRef<AbortController | null>(null)
+  const [panel, setPanel] = useState<PanelState | null>(null)
+  const [isPanelOpen, setPanelOpen] = useState(false)
+  const [panelTop, setPanelTop] = useState(0)
+  const [confirm, setConfirm] = useState<Confirm | null>(null)
+  const panelAbort = useRef<AbortController | null>(null)
   const scope = useRef(initialScope)
   const configs = useRef(initialConfigs)
-  const seen = useRef(initialSeen)
+  const memory = useRef({ seen: initialState.seen, snoozed: initialState.snoozed })
   const snapRef = useRef<Snapshot | null>(null)
   // Each refresh takes the next number; only the latest may write, so a slow one never overwrites a newer one.
   const epoch = useRef(0)
   const inflight = useRef(false)
   const lastRefreshAt = useRef(0)
   const offset = useRef(0)
+  // The selected item as of the last key, so keys typed faster than a render still move from the right place.
+  const pickedKey = useRef<string | null>(null)
 
   const pollMs = () => configs.current.current.pollMinutes * 60 * 1000
 
@@ -70,7 +96,7 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
     setFrame(0)
     try {
       configs.current = await loadConfigs(scope.current, (await readState()).repos)
-      const next = await refresh(scope.current, configs.current, seen.current, options)
+      const next = await refresh(scope.current, configs.current, memory.current, options)
       if (attempt !== epoch.current) {
         return
       }
@@ -94,6 +120,18 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
     }
   }
 
+  // Rebuilds the rows from the cache, after a change to what we remember (snoozes).
+  const reshow = () => load({ maxAgeMs: Infinity, canFetch: false }, { force: true, isQuiet: true })
+
+  const detectBranch = async () => {
+    const { root, branch } = scope.current
+    const result = root ? await run(['git', 'branch', '--show-current'], root) : null
+    const next = result?.exitCode === 0 ? result.stdout.trim() || null : branch
+    scope.current = { ...scope.current, branch: next }
+
+    return next !== branch
+  }
+
   useEffect(() => {
     // The cache first, so the screen fills at once; then GitHub if the cache is older than a minute.
     void load({ maxAgeMs: Infinity, canFetch: false }, { isQuiet: true }).then(() =>
@@ -101,11 +139,7 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
     )
     const timer = setInterval(async () => {
       setNow(Date.now())
-      const { root, branch } = scope.current
-      const current = root ? await run(['git', 'branch', '--show-current'], root) : null
-      const nextBranch = current?.exitCode === 0 ? current.stdout.trim() || null : branch
-      const hasMoved = nextBranch !== branch
-      scope.current = { ...scope.current, branch: nextBranch }
+      const hasMoved = await detectBranch()
       if (hasMoved || Date.now() - lastRefreshAt.current >= pollMs()) {
         void load({ maxAgeMs: pollMs(), canFetch: true })
       }
@@ -132,13 +166,18 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
     return () => clearTimeout(timer)
   }, [flash])
 
+  const remember = async (patch: Parameters<typeof updateState>[0]) => {
+    const stored = await updateState(patch)
+    memory.current = { seen: stored.seen, snoozed: stored.snoozed }
+  }
+
   const markSeen = async (pr: PrRow) => {
     if (!pr.lastOtherAt || !snapRef.current) {
       return
     }
-    seen.current = (await updateState({ seen: { [rowKey(pr)]: pr.lastOtherAt } })).seen
+    await remember({ seen: { [rowKey(pr)]: pr.lastOtherAt } })
     const unmark = (one: PrRow) => {
-      if (one.number !== pr.number || one.repo !== pr.repo) {
+      if (one.number !== pr.number || one.repo !== pr.repo || one.bucket === 'snoozed') {
         return one
       }
       const row = { ...one, isNew: false }
@@ -147,6 +186,14 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
     }
     const current = snapRef.current
     show({ ...current, rows: sortRows(current.rows.map(unmark)), current: current.current && unmark(current.current) })
+  }
+
+  const snooze = async (pr: PrRow, until: number | null) => {
+    const isAwake = pr.bucket !== 'snoozed'
+    await remember({ snoozed: { [rowKey(pr)]: isAwake ? { lastOtherAt: pr.lastOtherAt, until } : null } })
+    await reshow()
+    const when = until ? `until ${new Date(until).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })} or new activity` : 'until new activity'
+    setFlash({ text: isAwake ? `Snoozed #${pr.number} ${when}` : `#${pr.number} is back` })
   }
 
   const act = async (action: Action, pr: PrRow, reportText?: string) => {
@@ -168,33 +215,49 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
     setFlash({ text: `${name} prompt for #${pr.number} copied · paste it into Claude` })
   }
 
-  // Shows the PR's report: the one already made this session, or a new one when `isRedo` or there is none.
-  const openReport = async (pr: PrRow, isRedo = false) => {
-    setReportOpen(true)
-    setReportTop(0)
-    const isSame = report && report.pr.number === pr.number && report.pr.repo === pr.repo
-    if (isSame && report.status !== 'error' && !isRedo) {
+  // Runs a GitHub action, says how it went and refreshes from GitHub when it worked.
+  const runAction = async (work: Promise<Done>, after?: () => Promise<unknown>) => {
+    setFlash({ text: 'Working…' })
+    const result = await work
+    setFlash({ text: result.text, isError: !result.ok })
+    if (result.ok) {
+      await after?.()
+      void load({ maxAgeMs: 0, canFetch: true }, { force: true })
+    }
+  }
+
+  // Shows a panel: the one already made this session for the same kind and PR, or a new one when `isRedo` or there is none.
+  const openPanel = async (kind: PanelKind, pr: PrRow | null, isRedo = false) => {
+    setPanelOpen(true)
+    setPanelTop(0)
+    const isSame = panel?.kind === kind && panel.pr?.number === pr?.number && panel.pr?.repo === pr?.repo
+    if (isSame && panel.status !== 'error' && !isRedo) {
       return
     }
-    reportAbort.current?.abort()
+    panelAbort.current?.abort()
     const controller = new AbortController()
-    reportAbort.current = controller
+    panelAbort.current = controller
     const at = Date.now()
-    const write = (next: Partial<Report>) => {
-      if (reportAbort.current === controller) {
-        setReport(one => ({ ...(one ?? { pr, status: 'loading', text: '', at }), ...next }))
+    const write = (next: Partial<PanelState>) => {
+      if (panelAbort.current === controller) {
+        setPanel(one => ({ ...(one ?? { kind, pr, status: 'loading', text: '', at }), ...next }))
       }
     }
-    setReport({ pr, status: 'loading', text: '', at })
-    if (!pr.repo) {
-      write({ status: 'error', text: 'Unknown repository for this PR' })
-
-      return
+    setPanel({ kind, pr, status: 'loading', text: '', at })
+    const streaming = { onText: (text: string) => write({ text }), signal: controller.signal }
+    let result: ReportResult
+    if (kind === 'digest') {
+      const all = snapRef.current
+      const rows = all ? [...all.rows, ...(all.current && !all.rows.some(one => rowKey(one) === rowKey(all.current!)) ? [all.current] : [])] : []
+      result = await digest(rows.filter(one => one.state === 'OPEN'), all?.me ?? '', configs.current.current, streaming)
+    } else if (!pr?.repo) {
+      result = { failure: 'Unknown repository for this PR' }
+    } else if (kind === 'report') {
+      result = await quickReport(pr.repo, pr.number, configFor(configs.current, pr.repo), streaming)
+    } else {
+      const changes = await fetchChanges(pr, localOffset())
+      result = 'failure' in changes ? changes : { text: changesMarkdown(changes) }
     }
-    const result = await quickReport(pr.repo, pr.number, configFor(configs.current, pr.repo), {
-      onText: text => write({ text }),
-      signal: controller.signal,
-    })
     write('failure' in result ? { status: 'error', text: result.failure } : { status: 'done', text: result.text, at: Date.now() })
   }
 
@@ -202,6 +265,72 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
     const next = collapsed.includes(bucket) ? collapsed.filter(one => one !== bucket) : [...collapsed, bucket]
     setCollapsed(next)
     await updateState({ collapsed: next })
+  }
+
+  // ---- What each PR offers, used by both the hints line and the keys.
+  const canCheckout = (pr: PrRow) =>
+    pr.state === 'OPEN' && !!scope.current.root && pr.repo === scope.current.repo && pr.headRef !== scope.current.branch
+  const keysFor = (pr: PrRow): [string, string][] => {
+    const isOpen = pr.state === 'OPEN'
+    const keys: [string, string | null][] = [
+      ['v', reviewLabel(pr) || null],
+      ['d', pr.rereview ? 'Changes' : null],
+      ['c', pr.state === 'MERGED' ? 'Clean' : null],
+      ['m', pr.bucket === 'ready' ? 'Merge' : null],
+      ['R', rerequestable(pr).length > 0 ? 'Re-request' : null],
+      ['b', isOpen && pr.isBehind ? 'Update' : null],
+      ['a', 'Ask'],
+      ['r', 'Report'],
+      ['s', pr.isNew ? 'Seen' : null],
+      ['z', isOpen ? (pr.bucket === 'snoozed' ? 'Unsnooze' : 'Snooze') : null],
+      ['Z', isOpen && pr.bucket !== 'snoozed' ? 'Till tomorrow' : null],
+      ['g', canCheckout(pr) ? 'Checkout' : null],
+      ['o', pr.url ? 'Open' : null],
+    ]
+
+    return keys.filter((one): one is [string, string] => one[1] !== null)
+  }
+
+  const onPrKey = (input: string, pr: PrRow) => {
+    const offered = new Set(keysFor(pr).map(([key]) => key))
+    if (!offered.has(input)) {
+      return
+    }
+    const config = configFor(configs.current, pr.repo)
+    switch (input) {
+      case 'v':
+        return void act('review', pr)
+      case 'd':
+        return void openPanel('changes', pr)
+      case 'c':
+        return void act('clean', pr)
+      case 'a':
+        return void act('ask', pr)
+      case 'r':
+        return void openPanel('report', pr)
+      case 's':
+        return void markSeen(pr)
+      case 'z':
+        return void snooze(pr, null)
+      case 'Z':
+        return void snooze(pr, tomorrowMorning(Date.now()))
+      case 'o':
+        return openUrl(pr.url)
+      case 'g':
+        return void runAction(checkoutPr(pr, scope.current.root ?? ''), detectBranch)
+      case 'm':
+        return setConfirm({
+          text: `Merge #${pr.number} into ${pr.baseRef} with ${MERGE_WORDS[config.mergeMethod]}?`,
+          run: () => mergePr(pr, config.mergeMethod),
+        })
+      case 'b':
+        return setConfirm({ text: `Update #${pr.number}'s branch with ${pr.baseRef} (a merge commit on ${pr.headRef})?`, run: () => updateBranch(pr) })
+      case 'R': {
+        const logins = rerequestable(pr)
+
+        return setConfirm({ text: `Ask ${logins.join(', ')} to review #${pr.number} again?`, run: () => rerequestReview(pr, logins) })
+      }
+    }
   }
 
   // ---- Layout: every line of the scrolling area, then the selectable items among them.
@@ -221,6 +350,7 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
   ]
   // The remembered selection while it still exists, otherwise the first PR.
   const picked = items.find(item => item.key === selected) ?? items.find(item => item.pr) ?? items[0] ?? null
+  pickedKey.current = picked?.key ?? null
   const lines: Line[] = []
 
   const chip = (one: Chip, key: string) => (
@@ -238,6 +368,7 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
   const rowLine = (pr: PrRow, key: string, isPicked: boolean): ReactNode => {
     const marker = isPicked ? <Text bold>▸</Text> : pr.isNew ? <Text color="yellow">●</Text> : <Text> </Text>
     const extras = [...(isHere(pr, key) ? [{ text: '◉ here', dim: true }] : []), ...extraChips(pr)]
+    const stale = staleness(pr, now)
 
     return (
       <Box key={key}>
@@ -248,7 +379,7 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
         {cell(8, chip(ciChip(pr), 'ci'), 'ci')}
         {cell(4, chip(threadsChip(pr), 'threads'), 'threads')}
         <Box flexGrow={1} flexShrink={1} minWidth={0}>
-          <Text bold={pr.isNew || isPicked} wrap="truncate-end">
+          <Text bold={pr.isNew || isPicked} dimColor={pr.bucket === 'snoozed'} wrap="truncate-end">
             {pr.title}
           </Text>
         </Box>
@@ -266,24 +397,14 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
         )}
         {showAge && (
           <Box width={4} flexShrink={0} marginLeft={1} justifyContent="flex-end">
-            <Text dimColor>{pr.lastOtherAt ? age(pr.lastOtherAt, now) : ''}</Text>
+            <Text color={stale ? COLORS[stale] : undefined} dimColor={!stale}>
+              {pr.lastOtherAt ? age(pr.lastOtherAt, now) : ''}
+            </Text>
           </Box>
         )}
       </Box>
     )
   }
-
-  const hints = (pr: PrRow) =>
-    [
-      reviewLabel(pr) ? `v ${reviewLabel(pr)}` : null,
-      pr.state === 'MERGED' ? 'c Clean' : null,
-      'a Ask',
-      'r Report',
-      pr.isNew ? 's Seen' : null,
-      pr.url ? 'o Open' : null,
-    ]
-      .filter(Boolean)
-      .join('   ')
 
   const addRow = (pr: PrRow, key: string) => {
     const isPicked = key === picked?.key
@@ -308,7 +429,9 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
         node: (
           <Box marginLeft={9}>
             <Text color="cyan" wrap="truncate-end">
-              {hints(pr)}
+              {keysFor(pr)
+                .map(([one, label]) => `${one} ${label}`)
+                .join('   ')}
             </Text>
           </Box>
         ),
@@ -336,7 +459,7 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
     lines.push({ key: 'current-title', node: <Text dimColor>CURRENT BRANCH · {scope.current.branch}</Text> })
     addRow(current, 'current')
   }
-  if (snap?.checkedAt && list.every(pr => pr.bucket === 'others')) {
+  if (snap?.checkedAt && list.every(pr => pr.bucket === 'others' || pr.bucket === 'snoozed')) {
     lines.push({
       key: 'caught-up',
       node: (
@@ -367,10 +490,39 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
     }
   }
 
-  // ---- The report screen, which replaces the list while open.
-  const reportLines = report ? markdownLines(report.text || ' ', columns - 2) : []
-  const reportRoom = Math.max(3, height - 5)
-  const maxReportTop = Math.max(0, reportLines.length - reportRoom)
+  // ---- The panel, which replaces the list while open.
+  const panelLines = panel ? markdownLines(panel.text || ' ', columns - 2) : []
+  const panelRoom = Math.max(3, height - 5)
+  const panelMax = Math.max(0, panelLines.length - panelRoom)
+
+  const onPanelKey = (input: string, key: { escape: boolean; downArrow: boolean; upArrow: boolean; pageDown: boolean; pageUp: boolean }) => {
+    if (!panel) {
+      return
+    }
+    const isDone = panel.status === 'done'
+    const pr = panel.pr
+    if (input === 'q' || key.escape) {
+      setPanelOpen(false)
+    } else if (key.downArrow || input === 'j') {
+      setPanelTop(top => Math.min(panelMax, top + 1))
+    } else if (key.upArrow || input === 'k') {
+      setPanelTop(top => Math.max(0, top - 1))
+    } else if (key.pageDown || input === ' ') {
+      setPanelTop(top => Math.min(panelMax, top + panelRoom - 1))
+    } else if (key.pageUp) {
+      setPanelTop(top => Math.max(0, top - panelRoom + 1))
+    } else if (input === 'c' && isDone) {
+      void copy(panel.text).then(isCopied => setFlash(isCopied ? { text: 'Copied' } : { text: 'Could not copy', isError: true }))
+    } else if (input === 'x' && panel.status !== 'loading') {
+      void openPanel(panel.kind, pr, true)
+    } else if (input === 'o' && pr?.url) {
+      openUrl(pr.url)
+    } else if (input === 'a' && isDone && pr && panel.kind === 'report') {
+      void act('ask', pr, panel.text)
+    } else if (input === 'v' && pr && panel.kind === 'changes' && reviewLabel(pr)) {
+      void act('review', pr)
+    }
+  }
 
   useInput((input, key) => {
     if (key.ctrl && input === 'c') {
@@ -378,27 +530,18 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
 
       return
     }
-    if (isReportOpen && report) {
-      const isDone = report.status === 'done'
-      if (input === 'q' || key.escape) {
-        setReportOpen(false)
-      } else if (key.downArrow || input === 'j') {
-        setReportTop(top => Math.min(maxReportTop, top + 1))
-      } else if (key.upArrow || input === 'k') {
-        setReportTop(top => Math.max(0, top - 1))
-      } else if (key.pageDown || input === ' ') {
-        setReportTop(top => Math.min(maxReportTop, top + reportRoom - 1))
-      } else if (key.pageUp) {
-        setReportTop(top => Math.max(0, top - reportRoom + 1))
-      } else if (input === 'a' && isDone) {
-        void act('ask', report.pr, report.text)
-      } else if (input === 'c' && isDone) {
-        void copy(report.text).then(isCopied => setFlash(isCopied ? { text: 'Report copied' } : { text: 'Could not copy the report', isError: true }))
-      } else if (input === 'o' && report.pr.url) {
-        openUrl(report.pr.url)
-      } else if (input === 'x' && report.status !== 'loading') {
-        void openReport(report.pr, true)
+    if (confirm) {
+      setConfirm(null)
+      if (input === 'y') {
+        void runAction(confirm.run())
+      } else {
+        setFlash({ text: 'Cancelled' })
       }
+
+      return
+    }
+    if (isPanelOpen) {
+      onPanelKey(input, key)
 
       return
     }
@@ -412,32 +555,75 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
 
       return
     }
-    const index = items.findIndex(item => item.key === picked?.key)
-    if (key.downArrow || input === 'j') {
-      setSelected(items[Math.min(items.length - 1, index + 1)]?.key ?? null)
-    } else if (key.upArrow || input === 'k') {
-      setSelected(items[Math.max(0, index - 1)]?.key ?? null)
-    } else if (picked?.bucket && (key.return || input === ' ')) {
-      void toggleBucket(picked.bucket)
-    }
-    const pr = picked?.pr
-    if (!pr) {
+    if (input === 'D') {
+      void openPanel('digest', null)
+
       return
     }
-    if (input === 'v' && reviewLabel(pr)) {
-      void act('review', pr)
-    } else if (input === 'a') {
-      void act('ask', pr)
-    } else if (input === 'c' && pr.state === 'MERGED') {
-      void act('clean', pr)
-    } else if (input === 'r') {
-      void openReport(pr)
-    } else if (input === 's' && pr.isNew) {
-      void markSeen(pr)
-    } else if (input === 'o' && pr.url) {
-      openUrl(pr.url)
+    const index = items.findIndex(item => item.key === pickedKey.current)
+    const at = items[index] ?? picked
+    const move = (to: number) => {
+      pickedKey.current = items[to]?.key ?? null
+      setSelected(pickedKey.current)
+    }
+    if (key.downArrow || input === 'j') {
+      move(Math.min(items.length - 1, index + 1))
+    } else if (key.upArrow || input === 'k') {
+      move(Math.max(0, index - 1))
+    } else if (at?.bucket && (key.return || input === ' ')) {
+      void toggleBucket(at.bucket)
+    } else if (at?.pr) {
+      onPrKey(input, at.pr)
     }
   })
+
+  const footer = (keys: string) => (
+    <Box key="footer" flexDirection="column">
+      {confirm ? (
+        <Text color="yellow" wrap="truncate-end">
+          {confirm.text} y / n
+        </Text>
+      ) : (
+        <Text color={flash?.isError ? 'red' : 'green'} wrap="truncate-end">
+          {flash?.text ?? ' '}
+        </Text>
+      )}
+      <Text dimColor wrap="truncate-end">
+        {keys}
+      </Text>
+    </Box>
+  )
+
+  if (isPanelOpen && panel) {
+    const { kind, pr, status } = panel
+    const model = kind === 'changes' ? '' : configFor(configs.current, pr?.repo ?? '').reportModel
+    const meta = [model, status === 'loading' ? 'loading…' : status === 'done' ? ago(new Date(panel.at).toISOString(), now) : ''].filter(Boolean).join(' · ')
+    const title = kind === 'digest' ? 'Digest · what to do first' : `${kind === 'report' ? 'Report' : 'Changes since my review'} · #${pr?.number} ${pr?.title}`
+    const keys = [
+      '↑↓ scroll',
+      status === 'done' && kind === 'report' ? 'a Ask with report' : null,
+      kind === 'changes' && pr && reviewLabel(pr) ? `v ${reviewLabel(pr)}` : null,
+      status === 'done' ? 'c Copy' : null,
+      pr?.url ? 'o Open' : null,
+      status !== 'loading' ? 'x Redo' : null,
+      'esc back',
+    ]
+
+    return (
+      <Panel
+        height={height}
+        title={title}
+        meta={meta}
+        subtitle={pr?.repo ?? (isAll ? 'all repos' : (scope.current.repo ?? ''))}
+        error={status === 'error' ? panel.text : undefined}
+        placeholder={status === 'loading' && !panel.text ? (kind === 'digest' ? 'Weighing your PRs…' : 'Reading the PR…') : undefined}
+        body={panelLines}
+        top={Math.min(panelTop, panelMax)}
+        room={panelRoom}
+        footer={footer(keys.filter(Boolean).join(' · '))}
+      />
+    )
+  }
 
   // ---- Fixed top and bottom lines around the scrolling area.
   const top: ReactNode[] = []
@@ -475,16 +661,6 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
   if (header) {
     top.push(<Box key="header">{header}</Box>)
   }
-  const footer = (
-    <Box key="footer" flexDirection="column">
-      <Text color={flash?.isError ? 'red' : 'green'} wrap="truncate-end">
-        {flash?.text ?? ' '}
-      </Text>
-      <Text dimColor wrap="truncate-end">
-        ↑↓ move · ⏎ fold · u refresh · q quit
-      </Text>
-    </Box>
-  )
 
   // Scroll just enough to keep every line of the selected item in view.
   const room = Math.max(3, height - top.length - 2)
@@ -497,60 +673,6 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
   }
   offset.current = Math.max(0, Math.min(offset.current, lines.length - room))
 
-  if (isReportOpen && report) {
-    const { pr, status } = report
-    const meta =
-      status === 'loading'
-        ? `${configFor(configs.current, pr.repo).reportModel} · writing…`
-        : status === 'done'
-          ? `${configFor(configs.current, pr.repo).reportModel} · ${ago(new Date(report.at).toISOString(), now)}`
-          : configFor(configs.current, pr.repo).reportModel
-    const keys = [
-      '↑↓ scroll',
-      status === 'done' ? 'a Ask with report' : null,
-      status === 'done' ? 'c Copy' : null,
-      pr.url ? 'o Open' : null,
-      status !== 'loading' ? 'x Redo' : null,
-      'esc back',
-    ]
-
-    return (
-      <Box flexDirection="column" height={height}>
-        <Box>
-          <Box flexGrow={1} flexShrink={1} minWidth={0}>
-            <Text bold wrap="truncate-end">
-              Report · #{pr.number} {pr.title}
-            </Text>
-          </Box>
-          <Box flexShrink={0} marginLeft={1}>
-            <Text dimColor>{meta}</Text>
-          </Box>
-        </Box>
-        <Text dimColor wrap="truncate-end">
-          {pr.repo}
-          {reportLines.length > reportRoom ? ` · lines ${Math.min(reportTop, maxReportTop) + 1}-${Math.min(reportLines.length, reportTop + reportRoom)} of ${reportLines.length}` : ''}
-        </Text>
-        <Box flexDirection="column" flexGrow={1} paddingLeft={1}>
-          {status === 'error' ? (
-            <Text color="red">{report.text}</Text>
-          ) : status === 'loading' && !report.text ? (
-            <Text dimColor>Reading the PR…</Text>
-          ) : (
-            reportLines.slice(Math.min(reportTop, maxReportTop), Math.min(reportTop, maxReportTop) + reportRoom).map((line, index) => (
-              <Box key={index}>{line}</Box>
-            ))
-          )}
-        </Box>
-        <Text color={flash?.isError ? 'red' : 'green'} wrap="truncate-end">
-          {flash?.text ?? ' '}
-        </Text>
-        <Text dimColor wrap="truncate-end">
-          {keys.filter(Boolean).join(' · ')}
-        </Text>
-      </Box>
-    )
-  }
-
   return (
     <Box flexDirection="column" height={height}>
       {top}
@@ -559,7 +681,7 @@ export function App({ initialScope, initialConfigs, initialSeen, initialCollapse
           <Box key={line.key}>{line.node}</Box>
         ))}
       </Box>
-      {footer}
+      {footer('↑↓ move · ⏎ fold · D digest · u refresh · q quit')}
     </Box>
   )
 }

@@ -4,7 +4,8 @@ import { parseArgs } from 'node:util'
 import { render } from 'ink'
 
 import type { PrRow } from './types'
-import { quickReport } from './ai'
+import { digest, quickReport } from './ai'
+import type { ReportResult } from './ai'
 import { readState, updateState } from './github'
 import { ago, alertOf, ciChip, extraChips, reviewChip, threadsChip } from './lib/lib'
 import type { Chip } from './lib/lib'
@@ -19,6 +20,7 @@ Commands:
   list      Print them once
   status    One-line summary for a status line; reads only the cache unless --fetch
   report N  AI status report of PR N (or owner/name#N), streamed as it is written
+  digest    AI summary of what to do first across your PRs (with --all, every repo)
 
 Options:
   --all     Every repo involving you, not only the current one
@@ -42,7 +44,7 @@ const isColored = values.color || !!process.stdout.isTTY
 const ANSI: Record<NonNullable<Chip['color']>, number> = { error: 31, warning: 33, success: 32, merged: 35 }
 
 const command = positionals[0] ?? (process.stdout.isTTY && process.stdin.isTTY ? 'view' : 'list')
-if (values.help || !['view', 'list', 'status', 'report'].includes(command)) {
+if (values.help || !['view', 'list', 'status', 'report', 'digest'].includes(command)) {
   console.log(USAGE)
   process.exit(values.help ? 0 : 1)
 }
@@ -60,23 +62,11 @@ if (command === 'report') {
     console.error(target ? 'Not inside a GitHub repository; pass owner/name#N' : 'Usage: prs report <N | owner/name#N>')
     process.exit(1)
   }
-  let printed = 0
-  const result = await quickReport(repo, Number(target[2]), configFor(configs, repo), {
-    onText: soFar => {
-      process.stdout.write(soFar.slice(printed))
-      printed = soFar.length
-    },
-  })
-  if ('failure' in result) {
-    console.error(result.failure)
-    process.exit(1)
-  }
-  process.stdout.write(`${result.text.slice(printed)}\n`)
-  process.exit(0)
+  await stream(quickReport(repo, Number(target[2]), configFor(configs, repo), { onText: write }))
 }
-const { seen, collapsed } = state
+const memory = { seen: state.seen, snoozed: state.snoozed }
 if (command === 'view') {
-  const app = render(<App initialScope={scope} initialConfigs={configs} initialSeen={seen} initialCollapsed={collapsed} />, {
+  const app = render(<App initialScope={scope} initialConfigs={configs} initialState={state} />, {
     alternateScreen: true,
   })
   await app.waitUntilExit()
@@ -85,8 +75,18 @@ if (command === 'view') {
 const pollMs = configs.current.pollMinutes * 60 * 1000
 const snapshot =
   command === 'status'
-    ? await refresh(scope, configs, seen, { maxAgeMs: pollMs, canFetch: values.fetch })
-    : await refresh(scope, configs, seen, { maxAgeMs: 60 * 1000, canFetch: true })
+    ? await refresh(scope, configs, memory, { maxAgeMs: pollMs, canFetch: values.fetch })
+    : await refresh(scope, configs, memory, { maxAgeMs: 60 * 1000, canFetch: true })
+
+if (command === 'digest') {
+  if (!snapshot.me) {
+    console.error(snapshot.error ?? 'No PRs loaded')
+    process.exit(1)
+  }
+  const { rows, current } = snapshot
+  const all = current && !rows.some(pr => pr.number === current.number && pr.repo === current.repo) ? [...rows, current] : rows
+  await stream(digest(all.filter(pr => pr.state === 'OPEN'), snapshot.me, configs.current, { onText: write }))
+}
 
 if (values.json) {
   console.log(JSON.stringify(snapshot, null, 2))
@@ -142,6 +142,7 @@ function printList(snap: Snapshot): void {
     { bucket: 'me', title: 'WAITING ON ME' },
     { bucket: 'ready', title: 'READY TO MERGE' },
     { bucket: 'others', title: 'WAITING ON OTHERS' },
+    { bucket: 'snoozed', title: 'SNOOZED' },
   ] as const
   for (const { bucket, title } of groups) {
     const group = snap.rows.filter(pr => pr.bucket === bucket)
@@ -155,4 +156,22 @@ function printList(snap: Snapshot): void {
       console.log(`${pr.isNew ? '●' : ' '} ${where}#${pr.number}${here}  ${pr.title}  [${chips(pr)}]  ${pr.isMine ? 'you' : pr.author}`)
     }
   }
+}
+
+// Prints text as it streams in, then exits: 1 with the reason when there is no answer.
+let printed = 0
+
+function write(soFar: string): void {
+  process.stdout.write(soFar.slice(printed))
+  printed = soFar.length
+}
+
+async function stream(answer: Promise<ReportResult>): Promise<never> {
+  const result = await answer
+  if ('failure' in result) {
+    console.error(result.failure)
+    process.exit(1)
+  }
+  process.stdout.write(`${result.text.slice(printed)}\n`)
+  process.exit(0)
 }

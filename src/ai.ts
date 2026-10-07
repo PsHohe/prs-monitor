@@ -2,10 +2,11 @@ import { tmpdir } from 'node:os'
 
 import { query } from '@anthropic-ai/claude-agent-sdk'
 
+import type { PrRow } from './types'
 import { localOffset } from './actions'
 import { gh } from './github'
 import type { RunResult } from './github'
-import { REPORT_SYSTEM, reportPrompt } from './lib/lib'
+import { DIGEST_SYSTEM, digestPrompt, REPORT_SYSTEM, reportPrompt } from './lib/lib'
 import type { Config, ReportData, ReportDismissal } from './lib/lib'
 
 const REPORT_FIELDS =
@@ -48,16 +49,37 @@ export async function quickReport(
     offsetMinutes: localOffset(),
   }
 
+  return complete(reportPrompt(data, config), REPORT_SYSTEM, config.reportModel, { onText, signal })
+}
+
+// What to do first across the given PRs, from the rows alone (no extra GitHub calls).
+export function digest(
+  rows: PrRow[],
+  me: string,
+  config: Config,
+  options: { onText?: (soFar: string) => void; signal?: AbortSignal } = {},
+): Promise<ReportResult> {
+  const prompt = digestPrompt(rows, { me, now: Date.now(), offsetMinutes: localOffset() }, config.sections['digest focus'])
+
+  return complete(prompt, DIGEST_SYSTEM, config.reportModel, options)
+}
+
+// One plain answer: no tools, none of the person's settings, hooks, plugins or MCP servers, nothing saved.
+async function complete(
+  prompt: string,
+  system: string,
+  model: string,
+  { onText, signal }: { onText?: (soFar: string) => void; signal?: AbortSignal },
+): Promise<ReportResult> {
   const abortController = new AbortController()
   signal?.addEventListener('abort', () => abortController.abort())
   let text = ''
   try {
-    // One plain answer: no tools, none of the person's settings, hooks, plugins or MCP servers, nothing saved.
     const messages = query({
-      prompt: reportPrompt(data, config),
+      prompt,
       options: {
-        model: config.reportModel,
-        systemPrompt: REPORT_SYSTEM,
+        model,
+        systemPrompt: system,
         effort: 'low',
         tools: [],
         settingSources: [],

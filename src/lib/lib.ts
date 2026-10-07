@@ -8,6 +8,7 @@ export type Config = {
   ticketPattern: string | null
   twinBases: string[]
   flakyChecks: string[]
+  mergeMethod: 'merge' | 'squash' | 'rebase'
   sections: Record<string, string>
 }
 
@@ -19,6 +20,7 @@ export const DEFAULT_CONFIG: Config = {
   ticketPattern: null,
   twinBases: [],
   flakyChecks: [],
+  mergeMethod: 'merge',
   sections: {},
 }
 
@@ -83,6 +85,7 @@ export function mergeConfig(files: ConfigFile[]): Config {
   return files.reduce<Config>((config, file) => {
     const v = file.values
     const review = v.on_new_review
+    const merge = v.merge_method
 
     return {
       pollMinutes: minutes(v.poll_interval) ?? config.pollMinutes,
@@ -92,6 +95,7 @@ export function mergeConfig(files: ConfigFile[]): Config {
       ticketPattern: v.ticket_pattern ?? config.ticketPattern,
       twinBases: list(v.twin_bases) ?? config.twinBases,
       flakyChecks: list(v.flaky_checks) ?? config.flakyChecks,
+      mergeMethod: merge === 'merge' || merge === 'squash' || merge === 'rebase' ? merge : config.mergeMethod,
       sections: { ...config.sections, ...file.sections },
     }
   }, DEFAULT_CONFIG)
@@ -269,11 +273,12 @@ function latest(events: Event[]): Event | null {
   return events.reduce<Event | null>((best, one) => (!best || one.at > best.at ? one : best), null)
 }
 
-function countApprovals(reviews: RawReview[]): number {
+// Each author's latest review, skipping pending ones and, unless `withComments`, comment-only ones.
+function latestReviews(reviews: RawReview[], withComments: boolean): RawReview[] {
   const byAuthor = new Map<string, RawReview>()
   for (const review of reviews) {
     const login = review.author?.login
-    if (!login || review.state === 'COMMENTED' || review.state === 'PENDING') {
+    if (!login || review.state === 'PENDING' || (!withComments && review.state === 'COMMENTED')) {
       continue
     }
     const previous = byAuthor.get(login)
@@ -282,7 +287,11 @@ function countApprovals(reviews: RawReview[]): number {
     }
   }
 
-  return [...byAuthor.values()].filter(r => r.state === 'APPROVED').length
+  return [...byAuthor.values()]
+}
+
+function countApprovals(reviews: RawReview[]): number {
+  return latestReviews(reviews, false).filter(r => r.state === 'APPROVED').length
 }
 
 export function ticketOf(text: string, ticket: RegExp | null): string | null {
@@ -348,12 +357,16 @@ export function toRow(
     url: raw.url ?? '',
     author: raw.author?.login ?? 'unknown',
     headRef: raw.headRefName ?? '',
+    headOid: raw.headRefOid ?? null,
     baseRef: raw.baseRefName ?? '',
     state: raw.state ?? 'OPEN',
     isMine,
     isDraft: raw.isDraft,
     review: raw.reviewDecision ?? '',
     approvals: countApprovals(raw.reviews),
+    reviewers: latestReviews(raw.reviews, true)
+      .filter(r => !isMe(r.author))
+      .map(r => ({ login: r.author?.login ?? '', state: r.state, at: r.submittedAt })),
     ci: ci.ci,
     ciDone: ci.done,
     ciTotal: ci.total,
@@ -797,4 +810,141 @@ export function reportPrompt(data: ReportData, config: Config): string {
   const focus = config.sections['report focus']
 
   return focus ? `${prompt}\n\n## What to focus on\n${focus}` : prompt
+}
+
+// A PR put aside until something new happens on it (lastOtherAt moves) or, with `until`, that time passes.
+export type Snooze = { lastOtherAt: string | null; until: number | null }
+
+export function isSnoozed(pr: PrRow, snooze: Snooze | undefined, now: number): boolean {
+  if (!snooze || pr.state !== 'OPEN') {
+    return false
+  }
+  const isSameActivity = (pr.lastOtherAt ?? null) === snooze.lastOtherAt
+
+  return isSameActivity && (snooze.until === null || snooze.until > now)
+}
+
+export function applySnoozes(rows: PrRow[], snoozed: Record<string, Snooze>, now: number): PrRow[] {
+  return rows.map(pr => (isSnoozed(pr, snoozed[rowKey(pr)], now) ? { ...pr, isNew: false, bucket: 'snoozed' as const } : pr))
+}
+
+// 9:00 tomorrow, local time.
+export function tomorrowMorning(now: number): number {
+  const at = new Date(now)
+  at.setDate(at.getDate() + 1)
+  at.setHours(9, 0, 0, 0)
+
+  return at.getTime()
+}
+
+// How long a PR has waited on me: warning after a day, error after three.
+export function staleness(pr: PrRow, now: number): 'warning' | 'error' | null {
+  if (pr.bucket !== 'me' || !pr.lastOtherAt) {
+    return null
+  }
+  const hours = (now - Date.parse(pr.lastOtherAt)) / 3600000
+
+  return hours >= 72 ? 'error' : hours >= 24 ? 'warning' : null
+}
+
+// On my open PR: the reviewers whose latest review is not an approval, to ask again after changes.
+export function rerequestable(pr: PrRow): string[] {
+  if (!pr.isMine || pr.state !== 'OPEN') {
+    return []
+  }
+
+  return pr.reviewers.filter(r => r.login && r.state !== 'APPROVED').map(r => r.login)
+}
+
+export const DIGEST_SYSTEM = [
+  'You triage the open pull requests of the person who asked, so they know what to do first today.',
+  'Be brief and concrete. Markdown, no preamble, no closing remarks. Sections, skipping any that would be empty:',
+  '**Do first**: up to three items, most urgent first, each one line with the PR number and the action.',
+  '**Then**: the rest of what waits on them, one line each.',
+  '**Ready to merge**: PR numbers only.',
+  '**Waiting on others**: one line naming what is stuck and on whom, only if something looks stalled.',
+  'Weigh blocking things (red CI on their PRs, conflicts, review requests, replies owed) over nice-to-haves, and older waits over newer ones.',
+  'Dates in the input are already MM/DD/YYYY HH:MM in local time: copy them exactly. Only use what the input says.',
+].join('\n')
+
+export function digestPrompt(rows: PrRow[], data: { me: string; now: number; offsetMinutes: number }, focus?: string): string {
+  const when = (at: string | null) => (at ? formatDate(at, data.offsetMinutes) : 'never')
+  const describe = (pr: PrRow) => {
+    const facts = [
+      pr.isMine ? 'mine' : `by ${pr.author}`,
+      `${pr.headRef} → ${pr.baseRef}`,
+      `review: ${pr.review || 'none'}, ${pr.approvals} approvals`,
+      `CI: ${pr.ci}${pr.failingChecks.length > 0 ? ` (failing: ${pr.failingChecks.join(', ')}${pr.isFlakyOnly ? ', known flaky' : ''})` : ''}`,
+      ...(pr.unresolved ? [`${pr.unresolved} unresolved threads`] : []),
+      ...(pr.hasConflicts ? ['merge conflicts'] : pr.isBehind ? ['behind its base'] : []),
+      ...(pr.isRequestedFromMe ? [pr.hasLastWord ? 'my review was requested, I spoke last' : 'my review is requested'] : []),
+      ...(pr.rereview ? [`changed since my ${pr.rereview.state} review on ${when(pr.rereview.at)}: ${pr.rereview.commits} commits${pr.rereview.isReplied ? ', replies' : ''}`] : []),
+      ...(pr.twin ? [`twin #${pr.twin.number} is ${pr.twin.state}`] : []),
+      ...(pr.stackedOn !== null ? [`stacked on #${pr.stackedOn}`] : []),
+      `last from others: ${pr.lastOtherWhat ?? 'nothing'} (${when(pr.lastOtherAt)})`,
+    ]
+
+    return `- ${pr.repo}#${pr.number} "${pr.title}": ${facts.join('; ')}`
+  }
+  const group = (bucket: PrBucket, title: string) => {
+    const some = rows.filter(pr => pr.bucket === bucket)
+
+    return some.length > 0 ? ['', `## ${title}`, ...some.map(describe)] : []
+  }
+  const lines = [
+    `Today is ${formatDate(data.now, data.offsetMinutes)}. I am ${data.me}.`,
+    ...group('me', 'Waiting on me'),
+    ...group('ready', 'Ready to merge'),
+    ...group('others', 'Waiting on others'),
+  ]
+  const snoozed = rows.filter(pr => pr.bucket === 'snoozed').length
+  if (snoozed > 0) {
+    lines.push('', `(${snoozed} snoozed PRs left out on purpose.)`)
+  }
+  const prompt = clip(lines.join('\n'), 60000)
+
+  return focus ? `${prompt}\n\n## What to focus on\n${focus}` : prompt
+}
+
+export type ChangesData = {
+  pr: PrRow
+  since: { at: string; oid: string | null }
+  commits: { oid: string; headline: string; author: string; at: string; isMerge: boolean }[]
+  // Files changed since the reviewed commit, or null when that commit is gone (history rewritten).
+  files: { path: string; status: string; additions: number; deletions: number }[] | null
+  prFiles: string[]
+  offsetMinutes: number
+}
+
+// What changed on a PR since my last review, as markdown: commits, then the PR's files they touched.
+export function changesMarkdown(data: ChangesData): string {
+  const short = (oid: string | null) => (oid ? oid.slice(0, 7) : 'unknown')
+  const when = (at: string) => formatDate(at, data.offsetMinutes)
+  const newer = data.commits.filter(c => c.at > data.since.at)
+  const lines = [`Since my **${data.pr.rereview?.state ?? 'last'}** review on ${when(data.since.at)} at \`${short(data.since.oid)}\`:`, '']
+  lines.push(`**Commits** (${newer.length})`)
+  for (const c of newer) {
+    lines.push(`- \`${short(c.oid)}\` ${when(c.at)} ${c.author}: ${c.isMerge ? `${c.headline} (merge)` : c.headline}`)
+  }
+  if (newer.length === 0) {
+    lines.push('- none; only replies since')
+  }
+  lines.push('')
+  if (data.files === null) {
+    lines.push(`**Files**: \`${short(data.since.oid)}\` is no longer in the history (rebased or force-pushed), so the files since then are unknown.`)
+
+    return lines.join('\n')
+  }
+  const inPr = new Set(data.prFiles)
+  const own = data.files.filter(f => inPr.has(f.path))
+  const fromBase = data.files.length - own.length
+  lines.push(`**Files** (${own.length})`)
+  for (const f of own) {
+    lines.push(`- ${f.path} \`+${f.additions} −${f.deletions}\`${f.status === 'added' ? ' (new)' : f.status === 'removed' ? ' (deleted)' : ''}`)
+  }
+  if (fromBase > 0) {
+    lines.push('', `${fromBase} more files changed only by what was merged in from ${data.pr.baseRef || 'the base'}; left out.`)
+  }
+
+  return lines.join('\n')
 }

@@ -1,6 +1,6 @@
 export type PrCi = 'pass' | 'fail' | 'running' | 'none'
 
-export type PrBucket = 'ready' | 'me' | 'others'
+export type PrBucket = 'ready' | 'me' | 'others' | 'snoozed'
 
 export type PrRow = {
   number: number
@@ -10,12 +10,15 @@ export type PrRow = {
   url: string
   author: string
   headRef: string
+  headOid: string | null
   baseRef: string
   state: string
   isMine: boolean
   isDraft: boolean
   review: string
   approvals: number
+  // Everyone but me who reviewed, with their latest review.
+  reviewers: { login: string; state: string; at: string }[]
   ci: PrCi
   ciDone: number
   ciTotal: number

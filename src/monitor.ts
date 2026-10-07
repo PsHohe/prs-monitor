@@ -3,8 +3,8 @@ import { join } from 'node:path'
 
 import type { PrBucket, PrRow } from './types'
 import { cachePath, fetchPrs, gh, readCache, run, writeCache } from './github'
-import { compileRegex, fromGraphql, linkRows, mergeConfig, parseConfigFile, pauseAfter, RATE_BACKOFF_MS, toRow } from './lib/lib'
-import type { Config, GqlPr, RowOptions, SharedCache } from './lib/lib'
+import { applySnoozes, compileRegex, fromGraphql, linkRows, mergeConfig, parseConfigFile, pauseAfter, RATE_BACKOFF_MS, toRow } from './lib/lib'
+import type { Config, GqlPr, RowOptions, SharedCache, Snooze } from './lib/lib'
 
 export type Scope = {
   // The git repository the CLI runs in, if any.
@@ -96,7 +96,7 @@ const EMPTY: Snapshot = { me: null, rows: [], current: null, checkedAt: null, pa
 export async function refresh(
   scope: Scope,
   configs: Configs,
-  seen: Record<string, string>,
+  memory: { seen: Record<string, string>; snoozed: Record<string, Snooze> },
   { maxAgeMs, canFetch }: RefreshOptions,
 ): Promise<Snapshot> {
   if (!scope.isAll && !scope.repo) {
@@ -159,7 +159,7 @@ export async function refresh(
       // The plugin's cache files predate the repository field; they only ever hold this repo.
       const { raw, unresolved } = fromGraphql(scope.repo && !node.repository ? { ...node, repository: { nameWithOwner: scope.repo } } : node)
 
-      return toRow(raw, shared.me, seen, optionsFor(raw.repo ?? ''), unresolved)
+      return toRow(raw, shared.me, memory.seen, optionsFor(raw.repo ?? ''), unresolved)
     })
   // Twins and stacks are found per repo, each with its own ticket pattern and twin bases.
   const link = (some: PrRow[], open: PrRow[]) =>
@@ -174,7 +174,11 @@ export async function refresh(
   let current: PrRow | null = null
   if (branch) {
     current = linked.find(pr => pr.repo === branch.repo && pr.headRef === branch.name) ?? null
-    if (!current) {
+    // A long-lived branch (develop, prod) has no PR of its own worth showing, only old promotions.
+    const isBase =
+      configFor(configs, branch.repo).twinBases.includes(branch.name) ||
+      linked.some(pr => pr.repo === branch.repo && pr.baseRef === branch.name)
+    if (!current && !isBase) {
       const branchPr = await branchLookup(shared, path, branch, canFetch && !(shared.pausedUntil && shared.pausedUntil > now))
       current = branchPr ? (link(toRows([branchPr]), rows)[0] ?? null) : null
     }
@@ -182,7 +186,7 @@ export async function refresh(
 
   return {
     me: shared.me,
-    rows: sortRows(linked.filter(pr => !pr.isDraft)),
+    rows: sortRows(applySnoozes(linked.filter(pr => !pr.isDraft), memory.snoozed, now)),
     current,
     checkedAt: shared.at,
     pausedUntil: shared.pausedUntil && shared.pausedUntil > now ? shared.pausedUntil : null,
@@ -219,7 +223,7 @@ async function branchLookup(
 }
 
 export function sortRows(rows: PrRow[]): PrRow[] {
-  const order: Record<PrBucket, number> = { me: 0, ready: 1, others: 2 }
+  const order: Record<PrBucket, number> = { me: 0, ready: 1, others: 2, snoozed: 3 }
 
   return [...rows].sort(
     (a, b) =>
