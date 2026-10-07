@@ -144,26 +144,42 @@ export async function writeCache(path: string, cache: SharedCache): Promise<void
 }
 
 // What the CLI remembers between runs; the plugin keeps its own copy in its plugin store.
-export type CliState = { seen: Record<string, string>; collapsed: string[] }
+export type CliState = {
+  seen: Record<string, string>
+  collapsed: string[]
+  // Where each repo was last seen on disk (owner/name → root), so --all can read its config.
+  repos: Record<string, string>
+}
 
 const STATE_PATH = join(STATE_DIR, 'cli-state.json')
 
 export async function readState(): Promise<CliState> {
   try {
     const value = JSON.parse(await Bun.file(STATE_PATH).text()) as Partial<CliState>
+    const isMap = (one: unknown): one is Record<string, string> => !!one && typeof one === 'object' && !Array.isArray(one)
 
     return {
-      seen: value.seen && typeof value.seen === 'object' ? value.seen : {},
+      seen: isMap(value.seen) ? value.seen : {},
       collapsed: Array.isArray(value.collapsed) ? value.collapsed : ['others'],
+      repos: isMap(value.repos) ? value.repos : {},
     }
   } catch {
-    return { seen: {}, collapsed: ['others'] }
+    return { seen: {}, collapsed: ['others'], repos: {} }
   }
 }
 
-export async function writeState(state: CliState): Promise<void> {
+// Merged over the file, so what another terminal saved meanwhile is kept.
+export async function updateState(patch: Partial<CliState>): Promise<CliState> {
+  const stored = await readState()
+  const next: CliState = {
+    seen: { ...stored.seen, ...patch.seen },
+    collapsed: patch.collapsed ?? stored.collapsed,
+    repos: { ...stored.repos, ...patch.repos },
+  }
   await mkdir(STATE_DIR, { recursive: true })
-  await Bun.write(STATE_PATH, JSON.stringify(state))
+  await Bun.write(STATE_PATH, JSON.stringify(next))
+
+  return next
 }
 
 // Fetched when Re-review is pressed: our threads with their replies, and our last review's summary.

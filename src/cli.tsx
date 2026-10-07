@@ -5,10 +5,10 @@ import { render } from 'ink'
 
 import type { PrRow } from './types'
 import { quickReport } from './ai'
-import { readState } from './github'
+import { readState, updateState } from './github'
 import { ago, alertOf, ciChip, extraChips, reviewChip, threadsChip } from './lib/lib'
 import type { Chip } from './lib/lib'
-import { detectScope, loadConfig, refresh } from './monitor'
+import { configFor, detectScope, loadConfigs, refresh } from './monitor'
 import type { Snapshot } from './monitor'
 import { App } from './ui/App'
 
@@ -43,7 +43,11 @@ if (values.help || !['view', 'list', 'status', 'report'].includes(command)) {
 }
 
 const scope = await detectScope(values.all)
-const config = await loadConfig(scope.root)
+let state = await readState()
+if (scope.repo && scope.root && state.repos[scope.repo] !== scope.root) {
+  state = await updateState({ repos: { [scope.repo]: scope.root } })
+}
+const configs = await loadConfigs(scope, state.repos)
 if (command === 'report') {
   const target = /^(?:([\w.-]+\/[\w.-]+)#)?(\d+)$/.exec(positionals[1] ?? '')
   const repo = target?.[1] ?? scope.repo
@@ -52,7 +56,7 @@ if (command === 'report') {
     process.exit(1)
   }
   let printed = 0
-  const result = await quickReport(repo, Number(target[2]), config, {
+  const result = await quickReport(repo, Number(target[2]), configFor(configs, repo), {
     onText: soFar => {
       process.stdout.write(soFar.slice(printed))
       printed = soFar.length
@@ -65,19 +69,19 @@ if (command === 'report') {
   process.stdout.write(`${result.text.slice(printed)}\n`)
   process.exit(0)
 }
-const { seen, collapsed } = await readState()
+const { seen, collapsed } = state
 if (command === 'view') {
-  const app = render(<App initialScope={scope} initialConfig={config} initialSeen={seen} initialCollapsed={collapsed} />, {
+  const app = render(<App initialScope={scope} initialConfigs={configs} initialSeen={seen} initialCollapsed={collapsed} />, {
     alternateScreen: true,
   })
   await app.waitUntilExit()
   process.exit(0)
 }
-const pollMs = config.pollMinutes * 60 * 1000
+const pollMs = configs.current.pollMinutes * 60 * 1000
 const snapshot =
   command === 'status'
-    ? await refresh(scope, config, seen, { maxAgeMs: pollMs, canFetch: values.fetch })
-    : await refresh(scope, config, seen, { maxAgeMs: 60 * 1000, canFetch: true })
+    ? await refresh(scope, configs, seen, { maxAgeMs: pollMs, canFetch: values.fetch })
+    : await refresh(scope, configs, seen, { maxAgeMs: 60 * 1000, canFetch: true })
 
 if (values.json) {
   console.log(JSON.stringify(snapshot, null, 2))

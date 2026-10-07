@@ -51,6 +51,29 @@ export async function loadConfig(root: string | null): Promise<Config> {
   return mergeConfig(files)
 }
 
+// The settings that apply to each repo's PRs: the home file plus the repo's own files when we know
+// where the repo is on disk. `current` is what applies to the repo the CLI runs in, or the home file.
+export type Configs = { home: Config; current: Config; byRepo: Record<string, Config> }
+
+export async function loadConfigs(scope: Scope, repos: Record<string, string>): Promise<Configs> {
+  const others = Object.entries(repos).filter(([repo]) => repo !== scope.repo)
+  const [home, current, ...loaded] = await Promise.all([
+    loadConfig(null),
+    loadConfig(scope.root),
+    ...others.map(([, root]) => loadConfig(root)),
+  ])
+  const byRepo: Record<string, Config> = Object.fromEntries(others.map(([repo], index) => [repo, loaded[index] ?? home]))
+  if (scope.repo) {
+    byRepo[scope.repo] = current
+  }
+
+  return { home, current, byRepo }
+}
+
+export function configFor(configs: Configs, repo: string): Config {
+  return configs.byRepo[repo] ?? configs.home
+}
+
 export type Snapshot = {
   me: string | null
   rows: PrRow[]
@@ -72,7 +95,7 @@ const EMPTY: Snapshot = { me: null, rows: [], current: null, checkedAt: null, pa
 
 export async function refresh(
   scope: Scope,
-  config: Config,
+  configs: Configs,
   seen: Record<string, string>,
   { maxAgeMs, canFetch }: RefreshOptions,
 ): Promise<Snapshot> {
@@ -83,7 +106,8 @@ export async function refresh(
   const path = cachePath(scope.isAll ? null : scope.repo)
   const cached = await readCache(path)
   const pausedUntil = cached?.pausedUntil && cached.pausedUntil > now ? cached.pausedUntil : null
-  const withMerged = !!config.ticketPattern && config.twinBases.length >= 2
+  const applying = scope.isAll ? [configs.home, ...Object.values(configs.byRepo)] : [configs.current]
+  const withMerged = applying.some(config => !!config.ticketPattern && config.twinBases.length >= 2)
   const branch = scope.repo && scope.branch ? { repo: scope.repo, name: scope.branch } : null
 
   let shared = cached?.me && now - cached.at < maxAgeMs ? cached : null
@@ -115,27 +139,44 @@ export async function refresh(
     return { ...EMPTY, error, pausedUntil: (await readCache(path))?.pausedUntil ?? null }
   }
 
-  const options: RowOptions = {
-    automated: compileRegex(config.automatedComments),
-    ticket: compileRegex(config.ticketPattern, 'i'),
-    flakyChecks: config.flakyChecks,
+  const options = new Map<string, RowOptions>()
+  const optionsFor = (repo: string): RowOptions => {
+    let one = options.get(repo)
+    if (!one) {
+      const config = configFor(configs, repo)
+      one = {
+        automated: compileRegex(config.automatedComments),
+        ticket: compileRegex(config.ticketPattern, 'i'),
+        flakyChecks: config.flakyChecks,
+      }
+      options.set(repo, one)
+    }
+
+    return one
   }
   const toRows = (nodes: GqlPr[]) =>
     nodes.map(node => {
       // The plugin's cache files predate the repository field; they only ever hold this repo.
       const { raw, unresolved } = fromGraphql(scope.repo && !node.repository ? { ...node, repository: { nameWithOwner: scope.repo } } : node)
 
-      return toRow(raw, shared.me, seen, options, unresolved)
+      return toRow(raw, shared.me, seen, optionsFor(raw.repo ?? ''), unresolved)
+    })
+  // Twins and stacks are found per repo, each with its own ticket pattern and twin bases.
+  const link = (some: PrRow[], open: PrRow[]) =>
+    some.map(pr => {
+      const config = configFor(configs, pr.repo)
+
+      return linkRows([pr], open, shared.merged, config.twinBases, optionsFor(pr.repo).ticket)[0] ?? pr
     })
   const rows = toRows(shared.open)
-  const linked = linkRows(rows, rows, shared.merged, config.twinBases, options.ticket)
+  const linked = link(rows, rows)
 
   let current: PrRow | null = null
   if (branch) {
     current = linked.find(pr => pr.repo === branch.repo && pr.headRef === branch.name) ?? null
     if (!current) {
       const branchPr = await branchLookup(shared, path, branch, canFetch && !(shared.pausedUntil && shared.pausedUntil > now))
-      current = branchPr ? (linkRows(toRows([branchPr]), rows, shared.merged, config.twinBases, options.ticket)[0] ?? null) : null
+      current = branchPr ? (link(toRows([branchPr]), rows)[0] ?? null) : null
     }
   }
 

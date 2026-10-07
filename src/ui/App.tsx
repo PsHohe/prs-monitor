@@ -6,11 +6,11 @@ import type { PrBucket, PrRow } from '../types'
 import { copy, notify, openUrl, promptFor, reviewLabel } from '../actions'
 import { quickReport } from '../ai'
 import type { Action } from '../actions'
-import { readState, run, writeState } from '../github'
+import { readState, run, updateState } from '../github'
 import { age, ago, bucketOf, ciChip, detailOf, extraChips, reviewChip, rowKey, threadsChip } from '../lib/lib'
-import type { Chip, Config } from '../lib/lib'
-import { loadConfig, refresh, sortRows } from '../monitor'
-import type { RefreshOptions, Scope, Snapshot } from '../monitor'
+import type { Chip } from '../lib/lib'
+import { configFor, loadConfigs, refresh, sortRows } from '../monitor'
+import type { Configs, RefreshOptions, Scope, Snapshot } from '../monitor'
 import { markdownLines } from './markdown'
 
 const TICK_MS = 60 * 1000
@@ -28,9 +28,9 @@ type Line = { key: string; item?: string; node: ReactNode }
 type Item = { key: string; pr?: PrRow; bucket?: PrBucket }
 type Report = { pr: PrRow; status: 'loading' | 'done' | 'error'; text: string; at: number }
 
-type Props = { initialScope: Scope; initialConfig: Config; initialSeen: Record<string, string>; initialCollapsed: string[] }
+type Props = { initialScope: Scope; initialConfigs: Configs; initialSeen: Record<string, string>; initialCollapsed: string[] }
 
-export function App({ initialScope, initialConfig, initialSeen, initialCollapsed }: Props) {
+export function App({ initialScope, initialConfigs, initialSeen, initialCollapsed }: Props) {
   const { exit } = useApp()
   const { columns, rows: height } = useWindowSize()
   const [snap, setSnap] = useState<Snapshot | null>(null)
@@ -44,7 +44,7 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
   const [reportTop, setReportTop] = useState(0)
   const reportAbort = useRef<AbortController | null>(null)
   const scope = useRef(initialScope)
-  const config = useRef(initialConfig)
+  const configs = useRef(initialConfigs)
   const seen = useRef(initialSeen)
   const snapRef = useRef<Snapshot | null>(null)
   // Each refresh takes the next number; only the latest may write, so a slow one never overwrites a newer one.
@@ -53,7 +53,7 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
   const lastRefreshAt = useRef(0)
   const offset = useRef(0)
 
-  const pollMs = () => config.current.pollMinutes * 60 * 1000
+  const pollMs = () => configs.current.current.pollMinutes * 60 * 1000
 
   const show = (next: Snapshot) => {
     snapRef.current = next
@@ -69,8 +69,8 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
     lastRefreshAt.current = Date.now()
     setFrame(0)
     try {
-      config.current = await loadConfig(scope.current.root)
-      const next = await refresh(scope.current, config.current, seen.current, options)
+      configs.current = await loadConfigs(scope.current, (await readState()).repos)
+      const next = await refresh(scope.current, configs.current, seen.current, options)
       if (attempt !== epoch.current) {
         return
       }
@@ -132,19 +132,11 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
     return () => clearTimeout(timer)
   }, [flash])
 
-  const saveState = async (next: { collapsed?: string[] }) => {
-    // Merged over the file, so seen marks from another terminal are kept.
-    const stored = await readState()
-    seen.current = { ...stored.seen, ...seen.current }
-    await writeState({ seen: seen.current, collapsed: next.collapsed ?? collapsed })
-  }
-
   const markSeen = async (pr: PrRow) => {
     if (!pr.lastOtherAt || !snapRef.current) {
       return
     }
-    seen.current = { ...seen.current, [rowKey(pr)]: pr.lastOtherAt }
-    await saveState({})
+    seen.current = (await updateState({ seen: { [rowKey(pr)]: pr.lastOtherAt } })).seen
     const unmark = (one: PrRow) => {
       if (one.number !== pr.number || one.repo !== pr.repo) {
         return one
@@ -158,7 +150,7 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
   }
 
   const act = async (action: Action, pr: PrRow, reportText?: string) => {
-    const prompt = await promptFor(action, pr, config.current, snapRef.current?.me ?? '', reportText)
+    const prompt = await promptFor(action, pr, configFor(configs.current, pr.repo), snapRef.current?.me ?? '', reportText)
     if ('failure' in prompt) {
       setFlash({ text: prompt.failure, isError: true })
 
@@ -199,7 +191,7 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
 
       return
     }
-    const result = await quickReport(pr.repo, pr.number, config.current, {
+    const result = await quickReport(pr.repo, pr.number, configFor(configs.current, pr.repo), {
       onText: text => write({ text }),
       signal: controller.signal,
     })
@@ -209,7 +201,7 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
   const toggleBucket = async (bucket: PrBucket) => {
     const next = collapsed.includes(bucket) ? collapsed.filter(one => one !== bucket) : [...collapsed, bucket]
     setCollapsed(next)
-    await saveState({ collapsed: next })
+    await updateState({ collapsed: next })
   }
 
   // ---- Layout: every line of the scrolling area, then the selectable items among them.
@@ -509,10 +501,10 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
     const { pr, status } = report
     const meta =
       status === 'loading'
-        ? `${config.current.reportModel} · writing…`
+        ? `${configFor(configs.current, pr.repo).reportModel} · writing…`
         : status === 'done'
-          ? `${config.current.reportModel} · ${ago(new Date(report.at).toISOString(), now)}`
-          : config.current.reportModel
+          ? `${configFor(configs.current, pr.repo).reportModel} · ${ago(new Date(report.at).toISOString(), now)}`
+          : configFor(configs.current, pr.repo).reportModel
     const keys = [
       '↑↓ scroll',
       status === 'done' ? 'a Ask with report' : null,
