@@ -104,6 +104,7 @@ type RawCommit = { authors: { login?: string }[]; committedDate: string }
 export type Check = { name?: string; context?: string; status?: string; conclusion?: string; state?: string }
 export type RawPr = {
   number: number
+  repo?: string
   title: string
   url?: string
   author: Author
@@ -121,11 +122,18 @@ export type RawPr = {
   reviews: RawReview[]
   commits: RawCommit[]
 }
-export type MergedPr = { number: number; title: string; headRefName: string; baseRefName: string }
+export type MergedPr = {
+  number: number
+  title: string
+  headRefName: string
+  baseRefName: string
+  repository?: { nameWithOwner: string }
+}
 
 // One PR as the monitor's own GraphQL query returns it (see REFRESH_QUERY in register.tsx).
 export type GqlPr = {
   number: number
+  repository?: { nameWithOwner: string }
   title: string
   url?: string
   author: Author
@@ -150,6 +158,7 @@ export function fromGraphql(node: GqlPr): { raw: RawPr; unresolved: number | nul
   const contexts = node.latest?.nodes[0]?.commit.statusCheckRollup?.contexts.nodes ?? null
   const raw: RawPr = {
     number: node.number,
+    repo: node.repository?.nameWithOwner,
     title: node.title,
     url: node.url,
     author: node.author,
@@ -182,6 +191,9 @@ export type SharedCache = {
   open: GqlPr[]
   merged: MergedPr[]
   pausedUntil: number | null
+  // The PR of each branch looked up since this fetch (null: none), so a branch without an open PR
+  // is not asked about again until the next fetch.
+  branches: Record<string, GqlPr | null>
 }
 
 export function parseCache(text: string): SharedCache | null {
@@ -197,6 +209,7 @@ export function parseCache(text: string): SharedCache | null {
       open: value.open,
       merged: Array.isArray(value.merged) ? value.merged : [],
       pausedUntil: typeof value.pausedUntil === 'number' ? value.pausedUntil : null,
+      branches: value.branches && typeof value.branches === 'object' ? value.branches : {},
     }
   } catch {
     return null
@@ -276,6 +289,11 @@ export function ticketOf(text: string, ticket: RegExp | null): string | null {
   return ticket ? (ticket.exec(text)?.[0]?.toUpperCase() ?? null) : null
 }
 
+// The key a PR is remembered by (seen state); the repo keeps numbers from different repos apart.
+export function rowKey(pr: { number: number; repo?: string }): string {
+  return pr.repo ? `${pr.repo}#${pr.number}` : String(pr.number)
+}
+
 export function toRow(
   raw: RawPr,
   me: string,
@@ -303,7 +321,7 @@ export function toRow(
   ]
   const myLast = latest(mine)
   const otherLast = latest(others)
-  const seenAt = seen[String(raw.number)]
+  const seenAt = seen[rowKey(raw)]
   const isNew = !!otherLast && !!myLast && otherLast.at > myLast.at && (!seenAt || otherLast.at > seenAt)
   const ci = summarizeCi(raw.statusCheckRollup)
   const isMine = isMe(raw.author)
@@ -325,6 +343,7 @@ export function toRow(
 
   const row: PrRow = {
     number: raw.number,
+    repo: raw.repo ?? '',
     title: raw.title,
     url: raw.url ?? '',
     author: raw.author?.login ?? 'unknown',
@@ -392,10 +411,11 @@ export function linkRows(
   twinBases: string[],
   ticket: RegExp | null,
 ): PrRow[] {
-  const byHead = new Map(open.map(pr => [pr.headRef, pr.number]))
+  const byHead = new Map(open.map(pr => [`${pr.repo}:${pr.headRef}`, pr.number]))
   const candidates = [
-    ...open.map(pr => ({ number: pr.number, ticket: pr.ticket, base: pr.baseRef, state: 'OPEN' })),
+    ...open.map(pr => ({ repo: pr.repo, number: pr.number, ticket: pr.ticket, base: pr.baseRef, state: 'OPEN' })),
     ...merged.map(pr => ({
+      repo: pr.repository?.nameWithOwner ?? '',
       number: pr.number,
       ticket: ticketOf(`${pr.title} ${pr.headRefName}`, ticket),
       base: pr.baseRefName,
@@ -404,12 +424,17 @@ export function linkRows(
   ]
 
   return rows.map(pr => {
-    const parent = byHead.get(pr.baseRef)
+    const parent = byHead.get(`${pr.repo}:${pr.baseRef}`)
     const stackedOn = parent !== undefined && parent !== pr.number && pr.state === 'OPEN' ? parent : null
     const match =
       pr.ticket && twinBases.includes(pr.baseRef)
         ? candidates.find(
-            one => one.number !== pr.number && one.ticket === pr.ticket && one.base !== pr.baseRef && twinBases.includes(one.base),
+            one =>
+              one.repo === pr.repo &&
+              one.number !== pr.number &&
+              one.ticket === pr.ticket &&
+              one.base !== pr.baseRef &&
+              twinBases.includes(one.base),
           )
         : undefined
     const linked = { ...pr, stackedOn, twin: match ? { number: match.number, state: match.state } : null }

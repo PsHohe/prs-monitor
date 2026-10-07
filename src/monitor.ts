@@ -1,0 +1,189 @@
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+import type { PrBucket, PrRow } from './types'
+import { cachePath, fetchPrs, gh, readCache, run, writeCache } from './github'
+import { compileRegex, fromGraphql, linkRows, mergeConfig, parseConfigFile, pauseAfter, RATE_BACKOFF_MS, toRow } from './lib/lib'
+import type { Config, GqlPr, RowOptions, SharedCache } from './lib/lib'
+
+export type Scope = {
+  // The git repository the CLI runs in, if any.
+  root: string | null
+  repo: string | null
+  branch: string | null
+  // Every repo involving me instead of only `repo`.
+  isAll: boolean
+}
+
+export async function detectScope(isAll: boolean): Promise<Scope> {
+  const top = await run(['git', 'rev-parse', '--show-toplevel'])
+  const root = top.exitCode === 0 ? top.stdout.trim() || null : null
+  if (!root) {
+    return { root: null, repo: null, branch: null, isAll }
+  }
+  const [viewed, branch] = await Promise.all([
+    gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'], root),
+    run(['git', 'branch', '--show-current'], root),
+  ])
+
+  return {
+    root,
+    repo: viewed.exitCode === 0 ? viewed.stdout.trim() || null : null,
+    branch: branch.exitCode === 0 ? branch.stdout.trim() || null : null,
+    isAll,
+  }
+}
+
+export async function loadConfig(root: string | null): Promise<Config> {
+  const paths = [
+    join(homedir(), '.claude', 'pr-monitor.md'),
+    ...(root ? [join(root, '.claude', 'pr-monitor.md'), join(root, '.claude', 'pr-monitor.local.md')] : []),
+  ]
+  const files = []
+  for (const path of paths) {
+    try {
+      files.push(parseConfigFile(await Bun.file(path).text()))
+    } catch {
+      // A missing layer falls through to the ones below it.
+    }
+  }
+
+  return mergeConfig(files)
+}
+
+export type Snapshot = {
+  me: string | null
+  rows: PrRow[]
+  // The PR of the current branch, which may be closed, merged or a draft.
+  current: PrRow | null
+  checkedAt: number | null
+  pausedUntil: number | null
+  error: string | null
+}
+
+export type RefreshOptions = {
+  // How old the cached result may be and still be used instead of asking GitHub; 0 always asks.
+  maxAgeMs: number
+  // False never asks GitHub and only reads the cache.
+  canFetch: boolean
+}
+
+const EMPTY: Snapshot = { me: null, rows: [], current: null, checkedAt: null, pausedUntil: null, error: null }
+
+export async function refresh(
+  scope: Scope,
+  config: Config,
+  seen: Record<string, string>,
+  { maxAgeMs, canFetch }: RefreshOptions,
+): Promise<Snapshot> {
+  if (!scope.isAll && !scope.repo) {
+    return { ...EMPTY, error: scope.root ? 'gh could not read this repository' : 'not inside a git repository (try --all)' }
+  }
+  const now = Date.now()
+  const path = cachePath(scope.isAll ? null : scope.repo)
+  const cached = await readCache(path)
+  const pausedUntil = cached?.pausedUntil && cached.pausedUntil > now ? cached.pausedUntil : null
+  const withMerged = !!config.ticketPattern && config.twinBases.length >= 2
+  const branch = scope.repo && scope.branch ? { repo: scope.repo, name: scope.branch } : null
+
+  let shared = cached?.me && now - cached.at < maxAgeMs ? cached : null
+  let error: string | null = null
+  // While paused only an explicit refresh (maxAgeMs 0) asks GitHub; everything else shows the last result.
+  const mayAsk = canFetch && !(pausedUntil && maxAgeMs > 0)
+  if (!shared && mayAsk) {
+    const fetched = await fetchPrs({ searchRepo: scope.isAll ? null : scope.repo, withOpen: true, withMerged, branch })
+    if ('failure' in fetched) {
+      if (fetched.isLimited) {
+        await writeCache(path, { ...(cached ?? { at: 0, me: '', open: [], merged: [], branches: {} }), pausedUntil: now + RATE_BACKOFF_MS })
+      } else {
+        error = fetched.failure
+      }
+    } else {
+      shared = {
+        at: now,
+        me: fetched.me,
+        open: fetched.open,
+        merged: fetched.merged,
+        pausedUntil: pauseAfter(fetched.rate, now),
+        branches: branch ? { [branchKey(branch)]: fetched.branchPr } : {},
+      }
+      await writeCache(path, shared)
+    }
+  }
+  shared ??= cached?.me ? cached : null
+  if (!shared) {
+    return { ...EMPTY, error, pausedUntil: (await readCache(path))?.pausedUntil ?? null }
+  }
+
+  const options: RowOptions = {
+    automated: compileRegex(config.automatedComments),
+    ticket: compileRegex(config.ticketPattern, 'i'),
+    flakyChecks: config.flakyChecks,
+  }
+  const toRows = (nodes: GqlPr[]) =>
+    nodes.map(node => {
+      // The plugin's cache files predate the repository field; they only ever hold this repo.
+      const { raw, unresolved } = fromGraphql(scope.repo && !node.repository ? { ...node, repository: { nameWithOwner: scope.repo } } : node)
+
+      return toRow(raw, shared.me, seen, options, unresolved)
+    })
+  const rows = toRows(shared.open)
+  const linked = linkRows(rows, rows, shared.merged, config.twinBases, options.ticket)
+
+  let current: PrRow | null = null
+  if (branch) {
+    current = linked.find(pr => pr.repo === branch.repo && pr.headRef === branch.name) ?? null
+    if (!current) {
+      const branchPr = await branchLookup(shared, path, branch, canFetch && !(shared.pausedUntil && shared.pausedUntil > now))
+      current = branchPr ? (linkRows(toRows([branchPr]), rows, shared.merged, config.twinBases, options.ticket)[0] ?? null) : null
+    }
+  }
+
+  return {
+    me: shared.me,
+    rows: sortRows(linked.filter(pr => !pr.isDraft)),
+    current,
+    checkedAt: shared.at,
+    pausedUntil: shared.pausedUntil && shared.pausedUntil > now ? shared.pausedUntil : null,
+    error,
+  }
+}
+
+function branchKey(branch: { repo: string; name: string }): string {
+  return `${branch.repo}:${branch.name}`
+}
+
+// The current branch's PR when the search did not return it (no open PR involving me): from the
+// cache when this fetch already looked, otherwise one small query whose answer is cached.
+async function branchLookup(
+  shared: SharedCache,
+  path: string,
+  branch: { repo: string; name: string },
+  mayAsk: boolean,
+): Promise<GqlPr | null> {
+  const key = branchKey(branch)
+  if (key in shared.branches) {
+    return shared.branches[key] ?? null
+  }
+  if (!mayAsk) {
+    return null
+  }
+  const fetched = await fetchPrs({ searchRepo: branch.repo, withOpen: false, withMerged: false, branch })
+  if ('failure' in fetched) {
+    return null
+  }
+  await writeCache(path, { ...shared, branches: { ...shared.branches, [key]: fetched.branchPr } })
+
+  return fetched.branchPr
+}
+
+export function sortRows(rows: PrRow[]): PrRow[] {
+  const order: Record<PrBucket, number> = { me: 0, ready: 1, others: 2 }
+
+  return [...rows].sort(
+    (a, b) =>
+      order[a.bucket] - order[b.bucket] ||
+      Number(b.isNew) - Number(a.isNew) ||
+      (b.lastOtherAt ?? '').localeCompare(a.lastOtherAt ?? ''),
+  )
+}

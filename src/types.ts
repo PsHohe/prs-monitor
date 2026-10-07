@@ -4,6 +4,8 @@ export type PrBucket = 'ready' | 'me' | 'others'
 
 export type PrRow = {
   number: number
+  // owner/name; empty when unknown.
+  repo: string
   title: string
   url: string
   author: string

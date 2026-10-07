@@ -330,7 +330,7 @@ test('polling pauses until the reset once the GraphQL budget runs low', () => {
   expect(pauseAfter({ remaining: 0, resetAt: 'soon' }, now)).toBe(now + 15 * 60 * 1000)
   expect(isRateLimited('gh: API rate limit already exceeded for user ID 1.')).toBe(true)
   expect(parseCache('{"at":1}')).toBeNull()
-  expect(parseCache('{"at":1,"me":"me","open":[]}')).toEqual({ at: 1, me: 'me', open: [], merged: [], pausedUntil: null })
+  expect(parseCache('{"at":1,"me":"me","open":[]}')).toEqual({ at: 1, me: 'me', open: [], merged: [], pausedUntil: null, branches: {} })
 })
 
 test('a PR we reviewed offers a re-review once the author pushes or replies', () => {
