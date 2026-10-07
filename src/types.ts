@@ -1,3 +1,5 @@
+import type { ThreadSummary } from './lib/lib'
+
 export type PrCi = 'pass' | 'fail' | 'running' | 'none'
 
 export type PrBucket = 'ready' | 'me' | 'others' | 'snoozed'
@@ -27,6 +29,8 @@ export type PrRow = {
   hasConflicts: boolean
   isBehind: boolean
   unresolved: number | null
+  // Unresolved review threads waiting for my reply; null when their details were not loaded.
+  replies: ThreadSummary[] | null
   isRequestedFromMe: boolean
   ticket: string | null
   stackedOn: number | null

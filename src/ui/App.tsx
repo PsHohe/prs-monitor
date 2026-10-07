@@ -14,6 +14,7 @@ import {
   ago,
   bucketOf,
   changesMarkdown,
+  threadsMarkdown,
   ciChip,
   detailOf,
   extraChips,
@@ -45,8 +46,8 @@ type Flash = { text: string; isError?: boolean }
 // One terminal line; `item` is the selectable item it belongs to.
 type Line = { key: string; item?: string; node: ReactNode }
 type Item = { key: string; pr?: PrRow; bucket?: PrBucket }
-// A full-screen text view over the list: a PR's report, what changed since my review, or the digest.
-type PanelKind = 'report' | 'changes' | 'digest'
+// A full-screen text view over the list: a PR's report, what changed since my review, its threads waiting on me, or the digest.
+type PanelKind = 'report' | 'changes' | 'digest' | 'threads'
 type PanelState = { kind: PanelKind; pr: PrRow | null; status: 'loading' | 'done' | 'error'; text: string; at: number }
 // A GitHub action waiting for y.
 type Confirm = { text: string; run: () => Promise<Done> }
@@ -211,7 +212,7 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     if (action !== 'clean') {
       await markSeen(pr)
     }
-    const name = action === 'review' ? reviewLabel(pr) : action === 'clean' ? 'Cleanup' : 'Ask'
+    const name = { review: reviewLabel(pr), clean: 'Cleanup', ask: 'Ask', replies: 'Replies' }[action]
     setFlash({ text: `${name} prompt for #${pr.number} copied · paste it into Claude` })
   }
 
@@ -231,7 +232,8 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     setPanelOpen(true)
     setPanelTop(0)
     const isSame = panel?.kind === kind && panel.pr?.number === pr?.number && panel.pr?.repo === pr?.repo
-    if (isSame && panel.status !== 'error' && !isRedo) {
+    // Threads come from the rows, so they are always rebuilt.
+    if (isSame && panel.status !== 'error' && !isRedo && kind !== 'threads') {
       return
     }
     panelAbort.current?.abort()
@@ -252,6 +254,8 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
       result = await digest(rows.filter(one => one.state === 'OPEN'), all?.me ?? '', configs.current.current, streaming)
     } else if (!pr?.repo) {
       result = { failure: 'Unknown repository for this PR' }
+    } else if (kind === 'threads') {
+      result = { text: threadsMarkdown(pr, localOffset()) }
     } else if (kind === 'report') {
       result = await quickReport(pr.repo, pr.number, configFor(configs.current, pr.repo), streaming)
     } else {
@@ -273,6 +277,7 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
   const keysFor = (pr: PrRow): [string, string][] => {
     const isOpen = pr.state === 'OPEN'
     const keys: [string, string | null][] = [
+      ['t', pr.replies && pr.replies.length > 0 ? `Threads (${pr.replies.length})` : null],
       ['v', reviewLabel(pr) || null],
       ['d', pr.rereview ? 'Changes' : null],
       ['c', pr.state === 'MERGED' ? 'Clean' : null],
@@ -300,6 +305,8 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     switch (input) {
       case 'v':
         return void act('review', pr)
+      case 't':
+        return void openPanel('threads', pr)
       case 'd':
         return void openPanel('changes', pr)
       case 'c':
@@ -519,6 +526,8 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
       openUrl(pr.url)
     } else if (input === 'a' && isDone && pr && panel.kind === 'report') {
       void act('ask', pr, panel.text)
+    } else if (input === 'a' && pr && panel.kind === 'threads' && pr.replies?.length) {
+      void act('replies', pr)
     } else if (input === 'v' && pr && panel.kind === 'changes' && reviewLabel(pr)) {
       void act('review', pr)
     }
@@ -596,12 +605,14 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
 
   if (isPanelOpen && panel) {
     const { kind, pr, status } = panel
-    const model = kind === 'changes' ? '' : configFor(configs.current, pr?.repo ?? '').reportModel
+    const model = kind === 'changes' || kind === 'threads' ? '' : configFor(configs.current, pr?.repo ?? '').reportModel
     const meta = [model, status === 'loading' ? 'loading…' : status === 'done' ? ago(new Date(panel.at).toISOString(), now) : ''].filter(Boolean).join(' · ')
-    const title = kind === 'digest' ? 'Digest · what to do first' : `${kind === 'report' ? 'Report' : 'Changes since my review'} · #${pr?.number} ${pr?.title}`
+    const names = { report: 'Report', changes: 'Changes since my review', threads: 'Threads waiting for your reply', digest: '' }
+    const title = kind === 'digest' ? 'Digest · what to do first' : `${names[kind]} · #${pr?.number} ${pr?.title}`
     const keys = [
       '↑↓ scroll',
       status === 'done' && kind === 'report' ? 'a Ask with report' : null,
+      kind === 'threads' && pr?.replies?.length ? 'a Draft replies' : null,
       kind === 'changes' && pr && reviewLabel(pr) ? `v ${reviewLabel(pr)}` : null,
       status === 'done' ? 'c Copy' : null,
       pr?.url ? 'o Open' : null,

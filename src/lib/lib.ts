@@ -137,6 +137,7 @@ export type MergedPr = {
 // One PR as the monitor's own GraphQL query returns it (see REFRESH_QUERY in register.tsx).
 export type GqlPr = {
   number: number
+  updatedAt?: string
   repository?: { nameWithOwner: string }
   title: string
   url?: string
@@ -188,6 +189,21 @@ export function fromGraphql(node: GqlPr): { raw: RawPr; unresolved: number | nul
   return { raw, unresolved: threads ? threads.filter(t => !t.isResolved).length : null }
 }
 
+// An unresolved review thread: who started it and who wrote last.
+export type ThreadSummary = {
+  path: string
+  line: number | null
+  isOutdated: boolean
+  starter: string
+  last: string
+  body: string
+  at: string
+  url: string
+}
+
+// The unresolved threads of one PR as of its updatedAt, so they are fetched again only when the PR changes.
+export type PrThreads = { updatedAt: string; unresolved: ThreadSummary[] }
+
 // What one session fetched, shared through a file so the other sessions on the same repo reuse it.
 export type SharedCache = {
   at: number
@@ -198,6 +214,8 @@ export type SharedCache = {
   // The PR of each branch looked up since this fetch (null: none), so a branch without an open PR
   // is not asked about again until the next fetch.
   branches: Record<string, GqlPr | null>
+  // Thread details by repo#number, for PRs with unresolved threads (the plugin does not keep these).
+  threads: Record<string, PrThreads>
 }
 
 export function parseCache(text: string): SharedCache | null {
@@ -214,6 +232,7 @@ export function parseCache(text: string): SharedCache | null {
       merged: Array.isArray(value.merged) ? value.merged : [],
       pausedUntil: typeof value.pausedUntil === 'number' ? value.pausedUntil : null,
       branches: value.branches && typeof value.branches === 'object' ? value.branches : {},
+      threads: value.threads && typeof value.threads === 'object' ? value.threads : {},
     }
   } catch {
     return null
@@ -303,12 +322,23 @@ export function rowKey(pr: { number: number; repo?: string }): string {
   return pr.repo ? `${pr.repo}#${pr.number}` : String(pr.number)
 }
 
+// The unresolved threads that wait for me: on my PR, any where someone else wrote last; on someone
+// else's, the ones I started where someone else wrote last. My automated comments do not count as replies.
+export function owedReplies(threads: ThreadSummary[], me: string, isMine: boolean, automated: RegExp | null): ThreadSummary[] {
+  return threads.filter(thread => {
+    const isMyLast = thread.last === me && !(automated && automated.test(thread.body))
+
+    return !isMyLast && (isMine || thread.starter === me)
+  })
+}
+
 export function toRow(
   raw: RawPr,
   me: string,
   seen: Record<string, string>,
   options: RowOptions,
   unresolved: number | null = null,
+  threads: ThreadSummary[] | null = null,
 ): PrRow {
   const isMe = (author: Author) => author?.login === me
   const isAutomated = (body: string) => !!options.automated && options.automated.test(body)
@@ -375,6 +405,7 @@ export function toRow(
     hasConflicts: raw.mergeable === 'CONFLICTING' || raw.mergeStateStatus === 'DIRTY',
     isBehind: raw.mergeStateStatus === 'BEHIND',
     unresolved,
+    replies: unresolved === 0 ? [] : threads && owedReplies(threads, me, isMine, options.automated),
     isRequestedFromMe,
     ticket: ticketOf(`${raw.title} ${raw.headRefName ?? ''}`, options.ticket),
     stackedOn: null,
@@ -400,7 +431,8 @@ export function bucketOf(pr: PrRow): PrBucket {
   // A pending review request only needs me while someone else spoke last: a reply that is not a
   // formal review leaves the request open on GitHub, but the ball is in the author's court.
   const isRequestPending = pr.isRequestedFromMe && !pr.hasLastWord
-  if (pr.isNew || isRequestPending || (pr.isMine && (isCiBlocking || pr.hasConflicts))) {
+  const owesReply = (pr.replies?.length ?? 0) > 0
+  if (pr.isNew || isRequestPending || owesReply || (pr.isMine && (isCiBlocking || pr.hasConflicts))) {
     return 'me'
   }
   const isReady =
@@ -540,6 +572,9 @@ export function extraChips(pr: PrRow): Chip[] {
   } else if (pr.isBehind) {
     chips.push({ text: '↓ behind', color: 'warning' })
   }
+  if (pr.replies && pr.replies.length > 0) {
+    chips.push({ text: `↩ ${pr.replies.length}`, color: 'warning' })
+  }
   if (pr.rereview) {
     const { commits, state } = pr.rereview
     const text = commits > 0 ? `Δ ${commits} commit${commits === 1 ? '' : 's'}` : 'Δ replies'
@@ -564,6 +599,10 @@ export function extraChips(pr: PrRow): Chip[] {
 // The detail line of a selected row: what happened last and why CI is red.
 export function detailOf(pr: PrRow, now: number): string {
   const parts: string[] = []
+  const owed = pr.replies?.length ?? 0
+  if (owed > 0) {
+    parts.push(`${owed} thread${owed === 1 ? '' : 's'} waiting for your reply`)
+  }
   if (pr.lastOtherWhat && pr.lastOtherAt) {
     parts.push(`last: ${pr.lastOtherWhat} · ${age(pr.lastOtherAt, now)} ago`)
   }
@@ -876,6 +915,7 @@ export function digestPrompt(rows: PrRow[], data: { me: string; now: number; off
       `review: ${pr.review || 'none'}, ${pr.approvals} approvals`,
       `CI: ${pr.ci}${pr.failingChecks.length > 0 ? ` (failing: ${pr.failingChecks.join(', ')}${pr.isFlakyOnly ? ', known flaky' : ''})` : ''}`,
       ...(pr.unresolved ? [`${pr.unresolved} unresolved threads`] : []),
+      ...(pr.replies && pr.replies.length > 0 ? [`${pr.replies.length} review threads wait for my reply`] : []),
       ...(pr.hasConflicts ? ['merge conflicts'] : pr.isBehind ? ['behind its base'] : []),
       ...(pr.isRequestedFromMe ? [pr.hasLastWord ? 'my review was requested, I spoke last' : 'my review is requested'] : []),
       ...(pr.rereview ? [`changed since my ${pr.rereview.state} review on ${when(pr.rereview.at)}: ${pr.rereview.commits} commits${pr.rereview.isReplied ? ', replies' : ''}`] : []),
@@ -947,4 +987,44 @@ export function changesMarkdown(data: ChangesData): string {
   }
 
   return lines.join('\n')
+}
+
+function threadWhere(thread: ThreadSummary): string {
+  return `${thread.path}${thread.line ? `:${thread.line}` : ''}${thread.isOutdated ? ' (outdated)' : ''}`
+}
+
+// The threads waiting for my reply, as markdown for the threads panel.
+export function threadsMarkdown(pr: PrRow, offsetMinutes: number): string {
+  const owed = pr.replies ?? []
+  if (owed.length === 0) {
+    return 'No review threads are waiting for your reply.'
+  }
+
+  return owed
+    .map(thread =>
+      [
+        `**${threadWhere(thread)}**`,
+        `started by ${thread.starter || 'someone'} · last from ${thread.last || 'someone'} on ${formatDate(thread.at, offsetMinutes)}`,
+        ...clip(thread.body, 600)
+          .split('\n')
+          .map(line => `  ${line}`),
+      ].join('\n'),
+    )
+    .join('\n\n')
+}
+
+export function repliesPrompt(pr: PrRow, config: Config): string | null {
+  const owed = pr.replies ?? []
+  if (owed.length === 0) {
+    return null
+  }
+  const lines = [
+    `Help me answer the review threads on PR #${pr.number} (${pr.title})${pr.url ? ` ${pr.url}` : ''} that wait for our reply.`,
+    'For each one, read the thread and the current code, then draft a reply (and the change, if one is needed). Do not post or push anything until I approve.',
+    '',
+    'Threads:',
+    ...owed.map((thread, index) => `${index + 1}. ${threadWhere(thread)}, last from ${thread.last}: "${clip(thread.body, 400)}"`),
+  ]
+
+  return withGuidance(lines.join('\n'), config.sections.opinion)
 }

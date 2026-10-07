@@ -4,15 +4,19 @@ import {
   applySnoozes,
   changesMarkdown,
   digestPrompt,
+  extraChips,
   mergeConfig,
+  owedReplies,
   parseConfigFile,
+  repliesPrompt,
   rerequestable,
   rowKey,
   staleness,
+  threadsMarkdown,
   tomorrowMorning,
   toRow,
 } from '../src/lib/lib'
-import type { ChangesData, RawPr, RowOptions } from '../src/lib/lib'
+import type { ChangesData, RawPr, RowOptions, ThreadSummary } from '../src/lib/lib'
 
 const PLAIN: RowOptions = { automated: null, ticket: null, flakyChecks: [] }
 const NOW = Date.parse('2026-10-07T12:00:00Z')
@@ -170,4 +174,55 @@ test('the digest prompt groups PRs by bucket, describes them and leaves snoozed 
   expect(text).not.toContain('#3 ')
   expect(text).toContain('(1 snoozed PRs left out on purpose.)')
   expect(text.endsWith('## What to focus on\nHotfixes first.')).toBe(true)
+})
+
+function thread(over: Partial<ThreadSummary>): ThreadSummary {
+  return {
+    path: 'app/Models/Bip/Plan.php',
+    line: 282,
+    isOutdated: false,
+    starter: 'ana',
+    last: 'ana',
+    body: 'Why exclude here?',
+    at: '2026-10-07T15:52:10Z',
+    url: 'https://github.com/PsHohe/pmc-aba-app/pull/425#discussion_r1',
+    ...over,
+  }
+}
+
+test('threads wait for me on my PR when someone else wrote last, and on others when I started them', () => {
+  const askedMe = thread({})
+  const iAnswered = thread({ last: 'me' })
+  const myQuestionAnswered = thread({ starter: 'me', last: 'dev' })
+  const theirOwnTalk = thread({ starter: 'ana', last: 'dev' })
+  const myBotLast = thread({ starter: 'ana', last: 'me', body: '🚀 deployed' })
+  const all = [askedMe, iAnswered, myQuestionAnswered, theirOwnTalk, myBotLast]
+
+  expect(owedReplies(all, 'me', true, /^🚀/)).toEqual([askedMe, myQuestionAnswered, theirOwnTalk, myBotLast])
+  expect(owedReplies(all, 'me', false, /^🚀/)).toEqual([myQuestionAnswered])
+  expect(owedReplies(all, 'me', true, null)).toEqual([askedMe, myQuestionAnswered, theirOwnTalk])
+})
+
+test('a reply owed puts the PR in waiting on me with a chip, and no unresolved threads means none owed', () => {
+  const owing = toRow(raw({}), 'me', {}, PLAIN, 1, [thread({})])
+  expect(owing.replies).toHaveLength(1)
+  expect(owing.bucket).toBe('me')
+  expect(extraChips(owing)).toContainEqual({ text: '↩ 1', color: 'warning' })
+
+  expect(toRow(raw({}), 'me', {}, PLAIN, 0).replies).toEqual([])
+  expect(toRow(raw({}), 'me', {}, PLAIN, 2).replies).toBeNull()
+})
+
+test('the threads panel and the replies prompt list the owed threads', () => {
+  const pr = toRow(raw({}), 'me', {}, PLAIN, 1, [thread({ isOutdated: true })])
+  const text = threadsMarkdown(pr, 0)
+  expect(text).toContain('**app/Models/Bip/Plan.php:282 (outdated)**')
+  expect(text).toContain('started by ana · last from ana on 10/07/2026 15:52')
+  expect(text).toContain('  Why exclude here?')
+
+  const prompt = repliesPrompt(pr, { ...mergeConfig([]), sections: { opinion: 'Be kind.' } })
+  expect(prompt).toContain('1. app/Models/Bip/Plan.php:282 (outdated), last from ana: "Why exclude here?"')
+  expect(prompt).toContain('Do not post or push anything until I approve.')
+  expect(prompt?.endsWith('Project guidance:\nBe kind.')).toBe(true)
+  expect(repliesPrompt({ ...pr, replies: [] }, mergeConfig([]))).toBeNull()
 })

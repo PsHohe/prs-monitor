@@ -49,8 +49,8 @@ if (values.help || !['view', 'list', 'status', 'report', 'digest'].includes(comm
   process.exit(values.help ? 0 : 1)
 }
 
-const scope = await detectScope(values.all)
 let state = await readState()
+const scope = await detectScope(values.all, state.repos)
 if (scope.repo && scope.root && state.repos[scope.repo] !== scope.root) {
   state = await updateState({ repos: { [scope.repo]: scope.root } })
 }

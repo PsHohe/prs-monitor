@@ -2,9 +2,9 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import type { PrBucket, PrRow } from './types'
-import { cachePath, fetchPrs, gh, readCache, run, writeCache } from './github'
+import { cachePath, fetchPrs, fetchThreadSummaries, gh, readCache, run, writeCache } from './github'
 import { applySnoozes, compileRegex, fromGraphql, linkRows, mergeConfig, parseConfigFile, pauseAfter, RATE_BACKOFF_MS, toRow } from './lib/lib'
-import type { Config, GqlPr, RowOptions, SharedCache, Snooze } from './lib/lib'
+import type { Config, GqlPr, PrThreads, RowOptions, SharedCache, Snooze } from './lib/lib'
 
 export type Scope = {
   // The git repository the CLI runs in, if any.
@@ -15,20 +15,22 @@ export type Scope = {
   isAll: boolean
 }
 
-export async function detectScope(isAll: boolean): Promise<Scope> {
+// `known` maps owner/name to where the repo was seen, so a repo seen before needs no GitHub call.
+export async function detectScope(isAll: boolean, known: Record<string, string>): Promise<Scope> {
   const top = await run(['git', 'rev-parse', '--show-toplevel'])
   const root = top.exitCode === 0 ? top.stdout.trim() || null : null
   if (!root) {
     return { root: null, repo: null, branch: null, isAll }
   }
+  const seen = Object.entries(known).find(([, path]) => path === root)?.[0]
   const [viewed, branch] = await Promise.all([
-    gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'], root),
+    seen ? null : gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'], root),
     run(['git', 'branch', '--show-current'], root),
   ])
 
   return {
     root,
-    repo: viewed.exitCode === 0 ? viewed.stdout.trim() || null : null,
+    repo: seen ?? (viewed?.exitCode === 0 ? viewed.stdout.trim() || null : null),
     branch: branch.exitCode === 0 ? branch.stdout.trim() || null : null,
     isAll,
   }
@@ -118,7 +120,7 @@ export async function refresh(
     const fetched = await fetchPrs({ searchRepo: scope.isAll ? null : scope.repo, withOpen: true, withMerged, branch })
     if ('failure' in fetched) {
       if (fetched.isLimited) {
-        await writeCache(path, { ...(cached ?? { at: 0, me: '', open: [], merged: [], branches: {} }), pausedUntil: now + RATE_BACKOFF_MS })
+        await writeCache(path, { ...(cached ?? { at: 0, me: '', open: [], merged: [], branches: {}, threads: {} }), pausedUntil: now + RATE_BACKOFF_MS })
       } else {
         error = fetched.failure
       }
@@ -130,6 +132,7 @@ export async function refresh(
         merged: fetched.merged,
         pausedUntil: pauseAfter(fetched.rate, now),
         branches: branch ? { [branchKey(branch)]: fetched.branchPr } : {},
+        threads: cached?.threads ?? {},
       }
       await writeCache(path, shared)
     }
@@ -138,6 +141,9 @@ export async function refresh(
   if (!shared) {
     return { ...EMPTY, error, pausedUntil: (await readCache(path))?.pausedUntil ?? null }
   }
+  // The plugin's cache files predate the repository field; they only ever hold this repo.
+  const repoOf = (node: GqlPr) => node.repository?.nameWithOwner ?? scope.repo ?? ''
+  const threads = await threadDetails(shared, path, repoOf, canFetch && !(shared.pausedUntil && shared.pausedUntil > now))
 
   const options = new Map<string, RowOptions>()
   const optionsFor = (repo: string): RowOptions => {
@@ -156,10 +162,10 @@ export async function refresh(
   }
   const toRows = (nodes: GqlPr[]) =>
     nodes.map(node => {
-      // The plugin's cache files predate the repository field; they only ever hold this repo.
-      const { raw, unresolved } = fromGraphql(scope.repo && !node.repository ? { ...node, repository: { nameWithOwner: scope.repo } } : node)
+      const repo = repoOf(node)
+      const { raw, unresolved } = fromGraphql(node.repository ? node : { ...node, repository: { nameWithOwner: repo } })
 
-      return toRow(raw, shared.me, memory.seen, optionsFor(raw.repo ?? ''), unresolved)
+      return toRow(raw, shared.me, memory.seen, optionsFor(repo), unresolved, threads[`${repo}#${node.number}`]?.unresolved ?? null)
     })
   // Twins and stacks are found per repo, each with its own ticket pattern and twin bases.
   const link = (some: PrRow[], open: PrRow[]) =>
@@ -194,6 +200,42 @@ export async function refresh(
   }
 }
 
+// Unresolved thread details for the PRs that have any, fetched again only for PRs updated since.
+async function threadDetails(
+  shared: SharedCache,
+  path: string,
+  repoOf: (node: GqlPr) => string,
+  mayAsk: boolean,
+): Promise<Record<string, PrThreads>> {
+  const wanted = shared.open
+    .filter(node => !node.isDraft && (node.reviewThreads?.nodes ?? []).some(thread => !thread.isResolved))
+    .map(node => ({ key: `${repoOf(node)}#${node.number}`, node }))
+  const kept: Record<string, PrThreads> = {}
+  for (const { key } of wanted) {
+    const one = shared.threads[key]
+    if (one) {
+      kept[key] = one
+    }
+  }
+  // Nodes from the plugin's cache have no updatedAt; then only missing details are fetched.
+  const stale = wanted.filter(({ key, node }) => !kept[key] || (!!node.updatedAt && kept[key].updatedAt !== node.updatedAt))
+  if (stale.length === 0 || !mayAsk) {
+    return kept
+  }
+  const fetched = await fetchThreadSummaries(stale.map(({ key }) => key))
+  if (!fetched) {
+    return kept
+  }
+  const threads = { ...kept, ...fetched }
+  // Saved only onto the same fetch, so a newer one written meanwhile by another terminal is not overwritten.
+  const latest = await readCache(path)
+  if (latest && latest.at === shared.at) {
+    await writeCache(path, { ...latest, threads })
+  }
+
+  return threads
+}
+
 function branchKey(branch: { repo: string; name: string }): string {
   return `${branch.repo}:${branch.name}`
 }
@@ -217,7 +259,9 @@ async function branchLookup(
   if ('failure' in fetched) {
     return null
   }
-  await writeCache(path, { ...shared, branches: { ...shared.branches, [key]: fetched.branchPr } })
+  const latest = await readCache(path)
+  const base = latest && latest.at === shared.at ? latest : shared
+  await writeCache(path, { ...base, branches: { ...base.branches, [key]: fetched.branchPr } })
 
   return fetched.branchPr
 }

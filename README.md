@@ -19,6 +19,7 @@ In the view: `↑↓`/`jk` move, `⏎` folds a group, `D` opens the digest, `u` 
 
 | Key | Does |
 | --- | --- |
+| `t` | Threads waiting for your reply (`↩ N`); in it `a` copies a prompt to draft the replies |
 | `v` | Review / Re-review: copies a review prompt (Re-review includes your earlier threads) |
 | `d` | Changes since your review: the new commits and the PR's files they touched |
 | `a` | Ask: copies a prompt asking Claude's opinion on the PR |
@@ -35,6 +36,8 @@ In the view: `↑↓`/`jk` move, `⏎` folds a group, `D` opens the digest, `u` 
 Panels (report, changes, digest) scroll with `↑↓`/space; `c` copies, `x` redoes, `esc` goes back.
 
 Prompts go to the clipboard: paste them into whichever Claude session you want. In "waiting on me" the age turns yellow after a day and red after three.
+
+A review thread waits for your reply (`↩`, and the PR moves to "waiting on me") when it is unresolved and someone else wrote last: any thread on your PR, or one you started on someone else's. Your own comments matching `automated_comments` don't count as replies.
 
 While open, the view checks every minute whether the poll interval passed or the branch changed, and sends a macOS notification on new activity or when a PR becomes ready to merge.
 
@@ -81,7 +84,7 @@ What the digest should weigh (read from the home file, or the current repo's).
 
 ## GitHub API budget
 
-A refresh is one GraphQL query of about 2–4 points. Results are cached in `~/.claude/pr-monitor/cache/`, shared with the plugin, so the two reuse each other's fetches. Polling pauses when fewer than 300 points remain, until the budget resets; `u` still asks.
+A refresh is one GraphQL query of about 2–4 points. PRs with unresolved threads get a second query (about 2 points each) only when they changed since the last one. Inside a repo `prs` has seen before, `prs status` and cached views make no GitHub calls at all. Results are cached in `~/.claude/pr-monitor/cache/`, shared with the plugin, so the two reuse each other's fetches. Polling pauses when fewer than 300 points remain, until the budget resets; `u` still asks.
 
 ## Develop
 

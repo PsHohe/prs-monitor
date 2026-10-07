@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path'
 
 import type { PrRow } from './types'
 import { isRateLimited, parseCache } from './lib/lib'
-import type { ChangesData, GqlPr, MergedPr, ReviewThread, SharedCache, Snooze } from './lib/lib'
+import type { ChangesData, GqlPr, MergedPr, PrThreads, ReviewThread, SharedCache, Snooze, ThreadSummary } from './lib/lib'
 
 export type RunResult = { exitCode: number; stdout: string; stderr: string }
 
@@ -30,7 +30,7 @@ export function gh(args: string[], cwd?: string): Promise<RunResult> {
 // Asks only for what the rows read: about 2 GraphQL points, where `gh pr list --json` with the same fields costs 32.
 const REFRESH_QUERY = `fragment row on PullRequest {
   number title url author { login } headRefName headRefOid baseRefName state isDraft reviewDecision mergeable mergeStateStatus
-  repository { nameWithOwner }
+  updatedAt repository { nameWithOwner }
   reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } } } }
   latest: commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
     ... on StatusContext { context state }
@@ -145,6 +145,68 @@ export async function writeCache(path: string, cache: SharedCache): Promise<void
 }
 
 // What the CLI remembers between runs; the plugin keeps its own copy in its plugin store.
+// The unresolved threads of the given PRs (repo#number keys), in one query of about 2 points per PR.
+export async function fetchThreadSummaries(keys: string[]): Promise<Record<string, PrThreads> | null> {
+  const targets = keys.slice(0, 20).flatMap(key => {
+    const match = /^([\w.-]+)\/([\w.-]+)#(\d+)$/.exec(key)
+
+    return match ? [{ key, owner: match[1] ?? '', name: match[2] ?? '', number: Number(match[3]) }] : []
+  })
+  if (targets.length === 0) {
+    return {}
+  }
+  const fields = `updatedAt reviewThreads(first: 100) { nodes {
+    isResolved isOutdated path line originalLine
+    first: comments(first: 1) { nodes { author { login } } }
+    last: comments(last: 1) { nodes { author { login } body createdAt url } }
+  } }`
+  const query = `query { ${targets
+    .map((one, index) => `p${index}: repository(owner: ${JSON.stringify(one.owner)}, name: ${JSON.stringify(one.name)}) { pullRequest(number: ${one.number}) { ${fields} } }`)
+    .join('\n')} }`
+  const result = await gh(['api', 'graphql', '-f', `query=${query}`])
+  if (result.exitCode !== 0) {
+    return null
+  }
+  type Author = { login?: string } | null
+  type Thread = {
+    isResolved: boolean
+    isOutdated: boolean
+    path: string
+    line: number | null
+    originalLine: number | null
+    first: { nodes: { author: Author }[] }
+    last: { nodes: { author: Author; body: string; createdAt: string; url: string }[] }
+  }
+  type Pr = { updatedAt: string; reviewThreads: { nodes: Thread[] } } | null
+  const data = (JSON.parse(result.stdout) as { data: Record<string, { pullRequest: Pr } | null> }).data
+  const out: Record<string, PrThreads> = {}
+  targets.forEach((one, index) => {
+    const pr = data[`p${index}`]?.pullRequest
+    if (!pr) {
+      return
+    }
+    const unresolved: ThreadSummary[] = pr.reviewThreads.nodes
+      .filter(thread => !thread.isResolved)
+      .map(thread => {
+        const last = thread.last.nodes[0]
+
+        return {
+          path: thread.path,
+          line: thread.line ?? thread.originalLine,
+          isOutdated: thread.isOutdated,
+          starter: thread.first.nodes[0]?.author?.login ?? '',
+          last: last?.author?.login ?? '',
+          body: (last?.body ?? '').slice(0, 500),
+          at: last?.createdAt ?? '',
+          url: last?.url ?? '',
+        }
+      })
+    out[one.key] = { updatedAt: pr.updatedAt, unresolved }
+  })
+
+  return out
+}
+
 export type CliState = {
   seen: Record<string, string>
   collapsed: string[]

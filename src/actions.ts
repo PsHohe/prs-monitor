@@ -1,9 +1,9 @@
 import type { PrRow } from './types'
 import { fetchThreads, run } from './github'
-import { askPrompt, cleanupPrompt, rereviewPrompt, reviewPrompt } from './lib/lib'
+import { askPrompt, cleanupPrompt, repliesPrompt, rereviewPrompt, reviewPrompt } from './lib/lib'
 import type { Config } from './lib/lib'
 
-export type Action = 'ask' | 'review' | 'clean'
+export type Action = 'ask' | 'review' | 'clean' | 'replies'
 
 // Minutes east of UTC, so prompts show local times.
 export function localOffset(): number {
@@ -29,6 +29,11 @@ export async function promptFor(
 ): Promise<{ text: string } | { failure: string }> {
   if (action === 'ask') {
     return { text: askPrompt(pr, config, report) }
+  }
+  if (action === 'replies') {
+    const text = repliesPrompt(pr, config)
+
+    return text ? { text } : { failure: 'No threads are waiting for your reply' }
   }
   if (action === 'clean') {
     const text = cleanupPrompt(pr, config)
