@@ -20,9 +20,15 @@ export function reviewLabel(pr: PrRow): string {
 }
 
 // The prompt for a Claude session, or why there is none.
-export async function promptFor(action: Action, pr: PrRow, config: Config, me: string): Promise<{ text: string } | { failure: string }> {
+export async function promptFor(
+  action: Action,
+  pr: PrRow,
+  config: Config,
+  me: string,
+  report?: string,
+): Promise<{ text: string } | { failure: string }> {
   if (action === 'ask') {
-    return { text: askPrompt(pr, config) }
+    return { text: askPrompt(pr, config, report) }
   }
   if (action === 'clean') {
     const text = cleanupPrompt(pr, config)

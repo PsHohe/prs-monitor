@@ -4,12 +4,14 @@ import type { ReactNode } from 'react'
 
 import type { PrBucket, PrRow } from '../types'
 import { copy, notify, openUrl, promptFor, reviewLabel } from '../actions'
+import { quickReport } from '../ai'
 import type { Action } from '../actions'
 import { readState, run, writeState } from '../github'
 import { age, ago, bucketOf, ciChip, detailOf, extraChips, reviewChip, rowKey, threadsChip } from '../lib/lib'
 import type { Chip, Config } from '../lib/lib'
 import { loadConfig, refresh, sortRows } from '../monitor'
 import type { RefreshOptions, Scope, Snapshot } from '../monitor'
+import { markdownLines } from './markdown'
 
 const TICK_MS = 60 * 1000
 const SPIN_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
@@ -24,6 +26,7 @@ type Flash = { text: string; isError?: boolean }
 // One terminal line; `item` is the selectable item it belongs to.
 type Line = { key: string; item?: string; node: ReactNode }
 type Item = { key: string; pr?: PrRow; bucket?: PrBucket }
+type Report = { pr: PrRow; status: 'loading' | 'done' | 'error'; text: string; at: number }
 
 type Props = { initialScope: Scope; initialConfig: Config; initialSeen: Record<string, string>; initialCollapsed: string[] }
 
@@ -36,6 +39,10 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
   const [collapsed, setCollapsed] = useState(initialCollapsed)
   const [flash, setFlash] = useState<Flash | null>(null)
   const [now, setNow] = useState(Date.now())
+  const [report, setReport] = useState<Report | null>(null)
+  const [isReportOpen, setReportOpen] = useState(false)
+  const [reportTop, setReportTop] = useState(0)
+  const reportAbort = useRef<AbortController | null>(null)
   const scope = useRef(initialScope)
   const config = useRef(initialConfig)
   const seen = useRef(initialSeen)
@@ -150,8 +157,8 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
     show({ ...current, rows: sortRows(current.rows.map(unmark)), current: current.current && unmark(current.current) })
   }
 
-  const act = async (action: Action, pr: PrRow) => {
-    const prompt = await promptFor(action, pr, config.current, snapRef.current?.me ?? '')
+  const act = async (action: Action, pr: PrRow, reportText?: string) => {
+    const prompt = await promptFor(action, pr, config.current, snapRef.current?.me ?? '', reportText)
     if ('failure' in prompt) {
       setFlash({ text: prompt.failure, isError: true })
 
@@ -167,6 +174,36 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
     }
     const name = action === 'review' ? reviewLabel(pr) : action === 'clean' ? 'Cleanup' : 'Ask'
     setFlash({ text: `${name} prompt for #${pr.number} copied · paste it into Claude` })
+  }
+
+  // Shows the PR's report: the one already made this session, or a new one when `isRedo` or there is none.
+  const openReport = async (pr: PrRow, isRedo = false) => {
+    setReportOpen(true)
+    setReportTop(0)
+    const isSame = report && report.pr.number === pr.number && report.pr.repo === pr.repo
+    if (isSame && report.status !== 'error' && !isRedo) {
+      return
+    }
+    reportAbort.current?.abort()
+    const controller = new AbortController()
+    reportAbort.current = controller
+    const at = Date.now()
+    const write = (next: Partial<Report>) => {
+      if (reportAbort.current === controller) {
+        setReport(one => ({ ...(one ?? { pr, status: 'loading', text: '', at }), ...next }))
+      }
+    }
+    setReport({ pr, status: 'loading', text: '', at })
+    if (!pr.repo) {
+      write({ status: 'error', text: 'Unknown repository for this PR' })
+
+      return
+    }
+    const result = await quickReport(pr.repo, pr.number, config.current, {
+      onText: text => write({ text }),
+      signal: controller.signal,
+    })
+    write('failure' in result ? { status: 'error', text: result.failure } : { status: 'done', text: result.text, at: Date.now() })
   }
 
   const toggleBucket = async (bucket: PrBucket) => {
@@ -249,6 +286,7 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
       reviewLabel(pr) ? `v ${reviewLabel(pr)}` : null,
       pr.state === 'MERGED' ? 'c Clean' : null,
       'a Ask',
+      'r Report',
       pr.isNew ? 's Seen' : null,
       pr.url ? 'o Open' : null,
     ]
@@ -305,7 +343,6 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
   if (current) {
     lines.push({ key: 'current-title', node: <Text dimColor>CURRENT BRANCH · {scope.current.branch}</Text> })
     addRow(current, 'current')
-    lines.push({ key: 'current-gap', node: <Text> </Text> })
   }
   if (snap?.checkedAt && list.every(pr => pr.bucket === 'others')) {
     lines.push({
@@ -338,8 +375,42 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
     }
   }
 
+  // ---- The report screen, which replaces the list while open.
+  const reportLines = report ? markdownLines(report.text || ' ', columns - 2) : []
+  const reportRoom = Math.max(3, height - 5)
+  const maxReportTop = Math.max(0, reportLines.length - reportRoom)
+
   useInput((input, key) => {
-    if (input === 'q' || key.escape || (key.ctrl && input === 'c')) {
+    if (key.ctrl && input === 'c') {
+      exit()
+
+      return
+    }
+    if (isReportOpen && report) {
+      const isDone = report.status === 'done'
+      if (input === 'q' || key.escape) {
+        setReportOpen(false)
+      } else if (key.downArrow || input === 'j') {
+        setReportTop(top => Math.min(maxReportTop, top + 1))
+      } else if (key.upArrow || input === 'k') {
+        setReportTop(top => Math.max(0, top - 1))
+      } else if (key.pageDown || input === ' ') {
+        setReportTop(top => Math.min(maxReportTop, top + reportRoom - 1))
+      } else if (key.pageUp) {
+        setReportTop(top => Math.max(0, top - reportRoom + 1))
+      } else if (input === 'a' && isDone) {
+        void act('ask', report.pr, report.text)
+      } else if (input === 'c' && isDone) {
+        void copy(report.text).then(isCopied => setFlash(isCopied ? { text: 'Report copied' } : { text: 'Could not copy the report', isError: true }))
+      } else if (input === 'o' && report.pr.url) {
+        openUrl(report.pr.url)
+      } else if (input === 'x' && report.status !== 'loading') {
+        void openReport(report.pr, true)
+      }
+
+      return
+    }
+    if (input === 'q' || key.escape) {
       exit()
 
       return
@@ -367,6 +438,8 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
       void act('ask', pr)
     } else if (input === 'c' && pr.state === 'MERGED') {
       void act('clean', pr)
+    } else if (input === 'r') {
+      void openReport(pr)
     } else if (input === 's' && pr.isNew) {
       void markSeen(pr)
     } else if (input === 'o' && pr.url) {
@@ -431,6 +504,60 @@ export function App({ initialScope, initialConfig, initialSeen, initialCollapsed
     offset.current = last - room + 1
   }
   offset.current = Math.max(0, Math.min(offset.current, lines.length - room))
+
+  if (isReportOpen && report) {
+    const { pr, status } = report
+    const meta =
+      status === 'loading'
+        ? `${config.current.reportModel} · writing…`
+        : status === 'done'
+          ? `${config.current.reportModel} · ${ago(new Date(report.at).toISOString(), now)}`
+          : config.current.reportModel
+    const keys = [
+      '↑↓ scroll',
+      status === 'done' ? 'a Ask with report' : null,
+      status === 'done' ? 'c Copy' : null,
+      pr.url ? 'o Open' : null,
+      status !== 'loading' ? 'x Redo' : null,
+      'esc back',
+    ]
+
+    return (
+      <Box flexDirection="column" height={height}>
+        <Box>
+          <Box flexGrow={1} flexShrink={1} minWidth={0}>
+            <Text bold wrap="truncate-end">
+              Report · #{pr.number} {pr.title}
+            </Text>
+          </Box>
+          <Box flexShrink={0} marginLeft={1}>
+            <Text dimColor>{meta}</Text>
+          </Box>
+        </Box>
+        <Text dimColor wrap="truncate-end">
+          {pr.repo}
+          {reportLines.length > reportRoom ? ` · lines ${Math.min(reportTop, maxReportTop) + 1}-${Math.min(reportLines.length, reportTop + reportRoom)} of ${reportLines.length}` : ''}
+        </Text>
+        <Box flexDirection="column" flexGrow={1} paddingLeft={1}>
+          {status === 'error' ? (
+            <Text color="red">{report.text}</Text>
+          ) : status === 'loading' && !report.text ? (
+            <Text dimColor>Reading the PR…</Text>
+          ) : (
+            reportLines.slice(Math.min(reportTop, maxReportTop), Math.min(reportTop, maxReportTop) + reportRoom).map((line, index) => (
+              <Box key={index}>{line}</Box>
+            ))
+          )}
+        </Box>
+        <Text color={flash?.isError ? 'red' : 'green'} wrap="truncate-end">
+          {flash?.text ?? ' '}
+        </Text>
+        <Text dimColor wrap="truncate-end">
+          {keys.filter(Boolean).join(' · ')}
+        </Text>
+      </Box>
+    )
+  }
 
   return (
     <Box flexDirection="column" height={height}>

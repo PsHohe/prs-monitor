@@ -4,6 +4,7 @@ import { parseArgs } from 'node:util'
 import { render } from 'ink'
 
 import type { PrRow } from './types'
+import { quickReport } from './ai'
 import { readState } from './github'
 import { ago, alertOf, ciChip, extraChips, reviewChip, threadsChip } from './lib/lib'
 import type { Chip } from './lib/lib'
@@ -17,6 +18,7 @@ Commands:
   (none)    Interactive view of open PRs involving you
   list      Print them once
   status    One-line summary for a status line; reads only the cache unless --fetch
+  report N  AI status report of PR N (or owner/name#N), streamed as it is written
 
 Options:
   --all     Every repo involving you, not only the current one
@@ -35,13 +37,34 @@ const { values, positionals } = parseArgs({
 })
 
 const command = positionals[0] ?? (process.stdout.isTTY && process.stdin.isTTY ? 'view' : 'list')
-if (values.help || !['view', 'list', 'status'].includes(command)) {
+if (values.help || !['view', 'list', 'status', 'report'].includes(command)) {
   console.log(USAGE)
   process.exit(values.help ? 0 : 1)
 }
 
 const scope = await detectScope(values.all)
 const config = await loadConfig(scope.root)
+if (command === 'report') {
+  const target = /^(?:([\w.-]+\/[\w.-]+)#)?(\d+)$/.exec(positionals[1] ?? '')
+  const repo = target?.[1] ?? scope.repo
+  if (!target || !repo) {
+    console.error(target ? 'Not inside a GitHub repository; pass owner/name#N' : 'Usage: prs report <N | owner/name#N>')
+    process.exit(1)
+  }
+  let printed = 0
+  const result = await quickReport(repo, Number(target[2]), config, {
+    onText: soFar => {
+      process.stdout.write(soFar.slice(printed))
+      printed = soFar.length
+    },
+  })
+  if ('failure' in result) {
+    console.error(result.failure)
+    process.exit(1)
+  }
+  process.stdout.write(`${result.text.slice(printed)}\n`)
+  process.exit(0)
+}
 const { seen, collapsed } = await readState()
 if (command === 'view') {
   const app = render(<App initialScope={scope} initialConfig={config} initialSeen={seen} initialCollapsed={collapsed} />, {
