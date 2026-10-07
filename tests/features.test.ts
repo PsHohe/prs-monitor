@@ -3,6 +3,7 @@ import { expect, test } from 'bun:test'
 import {
   applySnoozes,
   changesMarkdown,
+  conversationMarkdown,
   digestPrompt,
   extraChips,
   mergeConfig,
@@ -12,11 +13,13 @@ import {
   rerequestable,
   rowKey,
   staleness,
-  threadsMarkdown,
+  threadsChip,
+  threadMarkdown,
+  threadPages,
   tomorrowMorning,
   toRow,
 } from '../src/lib/lib'
-import type { ChangesData, RawPr, RowOptions, ThreadSummary } from '../src/lib/lib'
+import type { ChangesData, Conversation, RawPr, RowOptions, ThreadDetail, ThreadSummary } from '../src/lib/lib'
 
 const PLAIN: RowOptions = { automated: null, ticket: null, flakyChecks: [] }
 const NOW = Date.parse('2026-10-07T12:00:00Z')
@@ -207,22 +210,101 @@ test('a reply owed puts the PR in waiting on me with a chip, and no unresolved t
   const owing = toRow(raw({}), 'me', {}, PLAIN, 1, [thread({})])
   expect(owing.replies).toHaveLength(1)
   expect(owing.bucket).toBe('me')
-  expect(extraChips(owing)).toContainEqual({ text: '↩ 1', color: 'warning' })
+  expect(threadsChip(owing)).toEqual({ text: '↩1', color: 'warning' })
+  expect(extraChips(owing).map(chip => chip.text)).not.toContain('↩1')
 
   expect(toRow(raw({}), 'me', {}, PLAIN, 0).replies).toEqual([])
   expect(toRow(raw({}), 'me', {}, PLAIN, 2).replies).toBeNull()
 })
 
-test('the threads panel and the replies prompt list the owed threads', () => {
+test('the replies prompt lists the owed threads', () => {
   const pr = toRow(raw({}), 'me', {}, PLAIN, 1, [thread({ isOutdated: true })])
-  const text = threadsMarkdown(pr, 0)
-  expect(text).toContain('**app/Models/Bip/Plan.php:282 (outdated)**')
-  expect(text).toContain('started by ana · last from ana on 10/07/2026 15:52')
-  expect(text).toContain('  Why exclude here?')
-
   const prompt = repliesPrompt(pr, { ...mergeConfig([]), sections: { opinion: 'Be kind.' } })
   expect(prompt).toContain('1. app/Models/Bip/Plan.php:282 (outdated), last from ana: "Why exclude here?"')
   expect(prompt).toContain('Do not post or push anything until I approve.')
   expect(prompt?.endsWith('Project guidance:\nBe kind.')).toBe(true)
   expect(repliesPrompt({ ...pr, replies: [] }, mergeConfig([]))).toBeNull()
+})
+
+test('the PR view shows the description, then comments, reviews and threads in order', () => {
+  const data: Conversation = {
+    pr: toRow(raw({ author: { login: 'ana' } }), 'me', {}, PLAIN, 1),
+    body: '<!-- template -->\nAdds a timeframe.',
+    createdAt: '2026-10-05T10:00:00Z',
+    additions: 12,
+    deletions: 3,
+    changedFiles: 2,
+    commits: 4,
+    comments: [{ author: 'bob', body: 'Ping', at: '2026-10-07T09:00:00Z' }],
+    reviews: [
+      { author: 'me', state: 'CHANGES_REQUESTED', body: 'A few things', at: '2026-10-06T10:00:00Z' },
+      { author: 'me', state: 'COMMENTED', body: '', at: '2026-10-06T10:00:00Z' },
+      { author: 'me', state: 'PENDING', body: '', at: null },
+    ],
+    threads: [
+      {
+        path: 'app/Plan.php',
+        line: 282,
+        isResolved: false,
+        isOutdated: true,
+        at: '2026-10-06T10:00:00Z',
+        comments: [
+          { author: 'me', body: 'Why exclude here?', at: '2026-10-06T10:00:00Z' },
+          { author: 'ana', body: 'Legacy rows.', at: '2026-10-06T12:00:00Z' },
+        ],
+      },
+    ],
+    offsetMinutes: 0,
+  }
+  const text = conversationMarkdown(data)
+  expect(text).toContain('**ana** wants to merge `feature/PD-901` into `develop` · opened 10/05/2026 10:00')
+  expect(text).toContain('`+12 −3` in 2 files · 4 commits')
+  expect(text).toContain('## Description\n  Adds a timeframe.')
+  expect(text).not.toContain('template')
+  expect(text).toContain('## Conversation (3 · 1 unresolved threads)')
+  expect(text).toContain('**me** on `app/Plan.php:282` · 10/06/2026 10:00 · unresolved, outdated\n  Why exclude here?\n  ↳ **ana** · 10/06/2026 12:00\n    Legacy rows.')
+  expect(text.indexOf('requested changes')).toBeLessThan(text.indexOf('**bob** commented'))
+  expect(text).not.toContain('**me** reviewed')
+})
+
+function detail(over: Partial<ThreadDetail>): ThreadDetail {
+  return {
+    id: 'T1',
+    path: 'app/Plan.php',
+    line: 282,
+    isResolved: false,
+    isOutdated: false,
+    comments: [
+      { author: 'me', body: 'Why exclude here?', at: '2026-10-06T10:00:00Z' },
+      { author: 'ana', body: 'Fixed in abc.', at: '2026-10-07T15:52:00Z' },
+    ],
+    diffHunk: '@@ -1,3 +1,3 @@\n context\n-old\n+new',
+    url: 'https://github.com/o/r/pull/1#discussion_r1',
+    canReply: true,
+    canResolve: true,
+    ...over,
+  }
+}
+
+test('the threads panel puts the threads waiting on me first and leaves resolved ones out', () => {
+  const mineAnswered = detail({ id: 'A', url: 'a' })
+  const iWroteLast = detail({ id: 'B', url: 'b', comments: [{ author: 'me', body: 'Done', at: '2026-10-07T10:00:00Z' }] })
+  const resolved = detail({ id: 'C', url: 'c', isResolved: true })
+  const pages = threadPages([iWroteLast, resolved, mineAnswered], { me: 'me', isMine: false, automated: null })
+  expect(pages.map(one => [one.thread.id, one.isOwed])).toEqual([
+    ['A', true],
+    ['B', false],
+  ])
+})
+
+test('a thread page says why it waits, shows the code and every comment', () => {
+  const text = threadMarkdown({ thread: detail({ isOutdated: true }), isOwed: true }, 'me', 0)
+  expect(text).toContain('**app/Plan.php:282** (outdated: the code changed since)\n↩ Waiting on you: ana replied to your thread')
+  expect(text).toContain('```diff\n context\n-old\n+new\n```')
+  expect(text).toContain('**you** · 10/06/2026 10:00\n  Why exclude here?')
+  expect(text).toContain('**ana** · 10/07/2026 15:52\n  Fixed in abc.')
+
+  const theirs = threadMarkdown({ thread: detail({ comments: [{ author: 'bob', body: 'Hm', at: '2026-10-07T10:00:00Z' }] }), isOwed: true }, 'me', 0)
+  expect(theirs).toContain('↩ Waiting on you: bob commented on your PR')
+  expect(threadMarkdown({ thread: detail({}), isOwed: false }, 'me', 0)).toContain('Not waiting on you · last from ana')
 })

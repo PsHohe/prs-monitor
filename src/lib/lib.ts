@@ -546,8 +546,9 @@ export function reviewChip(pr: PrRow): Chip {
 
 export function ciChip(pr: PrRow): Chip {
   switch (pr.ci) {
+    // Passing is the usual case, so it stays quiet and the failures stand out.
     case 'pass':
-      return { text: '✓ CI', color: 'success' }
+      return { text: '✓ CI', dim: true }
     case 'fail':
       return pr.isFlakyOnly ? { text: '✗ CI~', color: 'warning' } : { text: '✗ CI', color: pr.isMine ? 'error' : 'warning' }
     case 'running':
@@ -557,8 +558,17 @@ export function ciChip(pr: PrRow): Chip {
   }
 }
 
+// ↩ when every unresolved thread waits for my reply, ⚑ otherwise.
 export function threadsChip(pr: PrRow): Chip {
-  return pr.unresolved ? { text: `⚑${pr.unresolved}`, color: 'warning' } : { text: '·', dim: true }
+  if (!pr.unresolved) {
+    return { text: '·', dim: true }
+  }
+
+  return { text: `${isAllOwed(pr) ? '↩' : '⚑'}${pr.unresolved}`, color: 'warning' }
+}
+
+function isAllOwed(pr: PrRow): boolean {
+  return !!pr.unresolved && pr.replies?.length === pr.unresolved
 }
 
 // The chips that only show when they apply, most urgent first.
@@ -572,12 +582,12 @@ export function extraChips(pr: PrRow): Chip[] {
   } else if (pr.isBehind) {
     chips.push({ text: '↓ behind', color: 'warning' })
   }
-  if (pr.replies && pr.replies.length > 0) {
-    chips.push({ text: `↩ ${pr.replies.length}`, color: 'warning' })
+  if (pr.replies && pr.replies.length > 0 && !isAllOwed(pr)) {
+    chips.push({ text: `↩${pr.replies.length}`, color: 'warning' })
   }
   if (pr.rereview) {
     const { commits, state } = pr.rereview
-    const text = commits > 0 ? `Δ ${commits} commit${commits === 1 ? '' : 's'}` : 'Δ replies'
+    const text = commits > 0 ? `Δ${commits}` : 'Δ replies'
     chips.push(state === 'APPROVED' ? { text, dim: true } : { text, color: 'warning' })
   }
   if (pr.isRequestedFromMe) {
@@ -666,6 +676,9 @@ export type ReviewThread = {
   isOutdated: boolean
   comments: { author: string; body: string; at: string }[]
 }
+
+// A thread as the threads panel needs it, to show it whole and act on it.
+export type ThreadDetail = ReviewThread & { id: string; diffHunk: string; url: string; canReply: boolean; canResolve: boolean }
 
 export function reviewPrompt(pr: PrRow, config: Config): string {
   const text = `Review PR #${pr.number} (${pr.title})${pr.url ? ` ${pr.url}` : ''} by ${pr.author} with the github-pr-review skill. Do not post anything until I approve.`
@@ -993,26 +1006,6 @@ function threadWhere(thread: ThreadSummary): string {
   return `${thread.path}${thread.line ? `:${thread.line}` : ''}${thread.isOutdated ? ' (outdated)' : ''}`
 }
 
-// The threads waiting for my reply, as markdown for the threads panel.
-export function threadsMarkdown(pr: PrRow, offsetMinutes: number): string {
-  const owed = pr.replies ?? []
-  if (owed.length === 0) {
-    return 'No review threads are waiting for your reply.'
-  }
-
-  return owed
-    .map(thread =>
-      [
-        `**${threadWhere(thread)}**`,
-        `started by ${thread.starter || 'someone'} · last from ${thread.last || 'someone'} on ${formatDate(thread.at, offsetMinutes)}`,
-        ...clip(thread.body, 600)
-          .split('\n')
-          .map(line => `  ${line}`),
-      ].join('\n'),
-    )
-    .join('\n\n')
-}
-
 export function repliesPrompt(pr: PrRow, config: Config): string | null {
   const owed = pr.replies ?? []
   if (owed.length === 0) {
@@ -1027,4 +1020,124 @@ export function repliesPrompt(pr: PrRow, config: Config): string | null {
   ]
 
   return withGuidance(lines.join('\n'), config.sections.opinion)
+}
+
+export type Conversation = {
+  pr: PrRow
+  body: string
+  createdAt: string
+  additions: number
+  deletions: number
+  changedFiles: number
+  commits: number
+  comments: { author: string; body: string; at: string }[]
+  reviews: { author: string; state: string; body: string; at: string | null }[]
+  threads: (ReviewThread & { at: string })[]
+  offsetMinutes: number
+}
+
+const REVIEW_WORDS: Record<string, string> = {
+  APPROVED: 'approved',
+  CHANGES_REQUESTED: 'requested changes',
+  COMMENTED: 'reviewed',
+  DISMISSED: 'reviewed (dismissed)',
+}
+
+// Bodies without template comments, indented under their heading line.
+function quoted(body: string): string[] {
+  const text = body.replace(/<!--[\s\S]*?-->/g, '').trim()
+
+  return text ? text.split('\n').map(line => `  ${line}`) : []
+}
+
+// The whole PR as markdown: its description, then comments, reviews and review threads in order.
+export function conversationMarkdown(data: Conversation): string {
+  const { pr } = data
+  const when = (at: string) => formatDate(at, data.offsetMinutes)
+  const open = data.threads.filter(thread => !thread.isResolved).length
+  const lines = [
+    `**${pr.author}** wants to merge \`${pr.headRef}\` into \`${pr.baseRef}\` · opened ${when(data.createdAt)}`,
+    `\`+${data.additions} −${data.deletions}\` in ${data.changedFiles} files · ${data.commits} commits`,
+    '',
+    '## Description',
+    ...(quoted(data.body).length > 0 ? quoted(data.body) : ['  No description.']),
+  ]
+  type Entry = { at: string; lines: string[] }
+  const entries: Entry[] = [
+    ...data.comments.map(c => ({ at: c.at, lines: [`**${c.author}** commented · ${when(c.at)}`, ...quoted(c.body)] })),
+    // A review with no summary only carries its threads, which show on their own.
+    ...data.reviews
+      .filter(r => r.at && (r.body.trim() || r.state !== 'COMMENTED'))
+      .map(r => ({ at: r.at ?? '', lines: [`**${r.author}** ${REVIEW_WORDS[r.state] ?? r.state.toLowerCase()} · ${when(r.at ?? '')}`, ...quoted(r.body)] })),
+    ...data.threads.map(thread => {
+      const [first, ...replies] = thread.comments
+      const status = [thread.isResolved ? 'resolved' : 'unresolved', thread.isOutdated ? 'outdated' : ''].filter(Boolean).join(', ')
+
+      return {
+        at: thread.at,
+        lines: [
+          `**${first?.author ?? 'someone'}** on \`${thread.path}${thread.line ? `:${thread.line}` : ''}\` · ${when(thread.at)} · ${status}`,
+          ...quoted(first?.body ?? ''),
+          ...replies.flatMap(reply => [`  ↳ **${reply.author}** · ${when(reply.at)}`, ...quoted(reply.body).map(line => `  ${line}`)]),
+        ],
+      }
+    }),
+  ].sort((a, b) => a.at.localeCompare(b.at))
+  lines.push('', `## Conversation (${entries.length}${open > 0 ? ` · ${open} unresolved threads` : ''})`)
+  if (entries.length === 0) {
+    lines.push('  Nothing yet.')
+  }
+  for (const entry of entries) {
+    lines.push('', ...entry.lines)
+  }
+
+  return lines.join('\n')
+}
+
+// The unresolved threads for the threads panel, those waiting for my reply first.
+export function threadPages(
+  threads: ThreadDetail[],
+  context: { me: string; isMine: boolean; automated: RegExp | null },
+): { thread: ThreadDetail; isOwed: boolean }[] {
+  const open = threads.filter(thread => !thread.isResolved)
+  const summary = (thread: ThreadDetail): ThreadSummary => {
+    const last = thread.comments.at(-1)
+
+    return {
+      path: thread.path,
+      line: thread.line,
+      isOutdated: thread.isOutdated,
+      starter: thread.comments[0]?.author ?? '',
+      last: last?.author ?? '',
+      body: last?.body ?? '',
+      at: last?.at ?? '',
+      url: thread.url,
+    }
+  }
+  const owed = new Set(owedReplies(open.map(summary), context.me, context.isMine, context.automated).map(one => one.url))
+  const pages = open.map(thread => ({ thread, isOwed: owed.has(thread.url) }))
+
+  return [...pages.filter(one => one.isOwed), ...pages.filter(one => !one.isOwed)]
+}
+
+// One thread as markdown: where it is, why it waits on me, the code it is on, then every comment.
+export function threadMarkdown(page: { thread: ThreadDetail; isOwed: boolean }, me: string, offsetMinutes: number): string {
+  const { thread, isOwed } = page
+  const starter = thread.comments[0]?.author ?? 'someone'
+  const last = thread.comments.at(-1)?.author ?? 'someone'
+  const why = !isOwed
+    ? `Not waiting on you · last from ${last === me ? 'you' : last}`
+    : starter === me
+      ? `↩ Waiting on you: ${last} replied to your thread`
+      : `↩ Waiting on you: ${last} commented on your PR`
+  const hunk = thread.diffHunk.split('\n').slice(1).slice(-8)
+  const lines = [`**${thread.path}${thread.line ? `:${thread.line}` : ''}**${thread.isOutdated ? ' (outdated: the code changed since)' : ''}`, why, '']
+  if (hunk.length > 0) {
+    lines.push('```diff', ...hunk, '```', '')
+  }
+  for (const comment of thread.comments) {
+    lines.push(`**${comment.author === me ? 'you' : comment.author}** · ${formatDate(comment.at, offsetMinutes)}`, ...quoted(comment.body), '')
+  }
+
+  return lines.join('\n').trimEnd()
 }

@@ -7,14 +7,28 @@ import { copy, localOffset, notify, openUrl, promptFor, reviewLabel } from '../a
 import type { Action } from '../actions'
 import { digest, quickReport } from '../ai'
 import type { ReportResult } from '../ai'
-import { checkoutPr, fetchChanges, mergePr, readState, rerequestReview, run, updateBranch, updateState } from '../github'
+import {
+  checkoutPr,
+  fetchChanges,
+  fetchConversation,
+  fetchThreads,
+  mergePr,
+  readState,
+  replyToThread,
+  rerequestReview,
+  resolveThread,
+  run,
+  updateBranch,
+  updateState,
+} from '../github'
 import type { CliState, Done } from '../github'
 import {
   age,
   ago,
   bucketOf,
   changesMarkdown,
-  threadsMarkdown,
+  compileRegex,
+  conversationMarkdown,
   ciChip,
   detailOf,
   extraChips,
@@ -22,10 +36,12 @@ import {
   reviewChip,
   rowKey,
   staleness,
+  threadMarkdown,
+  threadPages,
   threadsChip,
   tomorrowMorning,
 } from '../lib/lib'
-import type { Chip } from '../lib/lib'
+import type { Chip, ThreadDetail } from '../lib/lib'
 import { configFor, loadConfigs, refresh, sortRows } from '../monitor'
 import type { Configs, RefreshOptions, Scope, Snapshot } from '../monitor'
 import { markdownLines } from './markdown'
@@ -41,16 +57,50 @@ const BUCKETS: { bucket: PrBucket; title: string; color?: string }[] = [
 ]
 const COLORS: Record<NonNullable<Chip['color']>, string> = { error: 'red', warning: 'yellow', success: 'green', merged: 'magenta' }
 const MERGE_WORDS = { merge: 'a merge commit', squash: 'squash', rebase: 'rebase' } as const
+// What a PR key does, in the order the actions line shows them; `change` keys touch GitHub or git.
+type KeyGroup = 'copy' | 'view' | 'change' | 'mark'
+const KEY_GROUPS: KeyGroup[] = ['copy', 'view', 'change', 'mark']
+const HELP = `## List
+\`↑↓\` \`jk\` move · \`⏎\` fold a group or view a PR · \`/\` filter · \`A\` this repo / all repos · \`D\` digest · \`u\` refresh · \`?\` this help · \`q\` quit
 
-type Flash = { text: string; isError?: boolean }
+## On a PR
+**Copy a prompt for Claude** (cyan)
+\`v\` Review / Re-review · \`a\` Ask · \`c\` Clean a merged PR
+
+**View** (cyan)
+\`⏎\` the PR with its description and discussion · \`t\` unresolved threads, those waiting for your reply first · \`d\` changes since your review · \`r\` AI report · \`o\` open in the browser
+
+**Change** (yellow; all but checkout ask first)
+\`m\` merge · \`R\` ask reviewers again · \`b\` update the branch with its base · \`g\` check out the branch here
+
+**Mark**
+\`s\` seen · \`z\` snooze until new activity (again wakes it) · \`Z\` until 9:00 tomorrow or new activity
+
+## Panels
+\`↑↓\` \`jk\` scroll · \`space\` \`b\` page down / up · \`g\` \`G\` top / bottom · \`c\` copy · \`x\` redo · \`esc\` back
+In a PR \`a\` copies Ask; in a report \`a\` copies Ask with the report.
+In threads \`←→\` \`n\` \`p\` switch thread · \`r\` reply (⏎ posts, esc cancels) · \`s\` resolve (asks first) · \`o\` opens the thread · \`a\` copies a prompt drafting the replies.
+
+## Symbols
+\`●\` new activity from others · \`◉ here\` the current branch's PR
+\`✓ 2\` approvals · \`✗ changes\` changes requested · \`○ review\` no decision yet
+\`✓ CI\` passing · \`✗ CI\` failing · \`✗ CI~\` only flaky checks fail · \`◐ 3/5\` running
+\`⚑3\` unresolved threads · \`↩3\` threads waiting for your reply
+\`✓ ready\` ready to merge · \`✗ conflicts\` · \`↓ behind\` its base
+\`Δ3\` commits since your review · \`Δ replies\` replies since your review
+\`◆ requested\` your review is requested · \`↳#12\` stacked on #12 · \`⇄#12\` hotfix twin
+The last column is the time since someone else's last activity; in waiting on me it turns yellow after a day and red after three.`
+
+type Flash = { text: string; isError?: boolean; isSticky?: boolean }
 // One terminal line; `item` is the selectable item it belongs to.
 type Line = { key: string; item?: string; node: ReactNode }
 type Item = { key: string; pr?: PrRow; bucket?: PrBucket }
-// A full-screen text view over the list: a PR's report, what changed since my review, its threads waiting on me, or the digest.
-type PanelKind = 'report' | 'changes' | 'digest' | 'threads'
-type PanelState = { kind: PanelKind; pr: PrRow | null; status: 'loading' | 'done' | 'error'; text: string; at: number }
+// A full-screen text view over the list: a PR with its discussion, its report, what changed since my review, its threads (a page each), the digest or the help.
+type PanelKind = 'pr' | 'report' | 'changes' | 'digest' | 'threads' | 'help'
+type ThreadPage = { thread: ThreadDetail; isOwed: boolean; text: string }
+type PanelState = { kind: PanelKind; pr: PrRow | null; status: 'loading' | 'done' | 'error'; text: string; at: number; pages?: ThreadPage[] }
 // A GitHub action waiting for y.
-type Confirm = { text: string; run: () => Promise<Done> }
+type Confirm = { text: string; run: () => Promise<Done>; after?: () => Promise<unknown> }
 
 type Props = { initialScope: Scope; initialConfigs: Configs; initialState: CliState }
 
@@ -58,14 +108,22 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
   const { exit } = useApp()
   const { columns, rows: height } = useWindowSize()
   const [snap, setSnap] = useState<Snapshot | null>(null)
-  const [frame, setFrame] = useState<number | null>(null)
+  // How many refreshes and GitHub actions are running; the spinner turns while any is.
+  const [busy, setBusy] = useState(0)
+  const [frame, setFrame] = useState(0)
   const [selected, setSelected] = useState<string | null>(null)
+  const [filter, setFilter] = useState('')
+  const [isFiltering, setFiltering] = useState(false)
+  const [isAll, setAll] = useState(initialScope.isAll)
   const [collapsed, setCollapsed] = useState(initialState.collapsed)
   const [flash, setFlash] = useState<Flash | null>(null)
   const [now, setNow] = useState(Date.now())
   const [panel, setPanel] = useState<PanelState | null>(null)
   const [isPanelOpen, setPanelOpen] = useState(false)
   const [panelTop, setPanelTop] = useState(0)
+  const [panelPage, setPanelPage] = useState(0)
+  // A reply being typed to a thread.
+  const [draft, setDraft] = useState<{ thread: ThreadDetail; text: string } | null>(null)
   const [confirm, setConfirm] = useState<Confirm | null>(null)
   const panelAbort = useRef<AbortController | null>(null)
   const scope = useRef(initialScope)
@@ -94,7 +152,7 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     const attempt = ++epoch.current
     inflight.current = true
     lastRefreshAt.current = Date.now()
-    setFrame(0)
+    setBusy(count => count + 1)
     try {
       configs.current = await loadConfigs(scope.current, (await readState()).repos)
       const next = await refresh(scope.current, configs.current, memory.current, options)
@@ -114,11 +172,26 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
         setFlash({ text: err instanceof Error ? err.message : String(err), isError: true })
       }
     } finally {
+      setBusy(count => count - 1)
       if (attempt === epoch.current) {
         inflight.current = false
-        setFrame(null)
       }
     }
+  }
+
+  // Switches between the current repo and every repo: the cache first, then GitHub, as at start.
+  const toggleScope = () => {
+    if (isAll && !scope.current.repo) {
+      setFlash({ text: 'Not inside a GitHub repository', isError: true })
+
+      return
+    }
+    scope.current = { ...scope.current, isAll: !isAll }
+    setAll(!isAll)
+    setFilter('')
+    void load({ maxAgeMs: Infinity, canFetch: false }, { force: true, isQuiet: true }).then(() =>
+      load({ maxAgeMs: 60 * 1000, canFetch: true }, { force: true, isQuiet: true }),
+    )
   }
 
   // Rebuilds the rows from the cache, after a change to what we remember (snoozes).
@@ -150,16 +223,17 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
   }, [])
 
   useEffect(() => {
-    if (frame === null) {
+    if (busy === 0) {
       return
     }
-    const timer = setInterval(() => setFrame(one => (one === null ? null : (one + 1) % SPIN_FRAMES.length)), 100)
+    const timer = setInterval(() => setFrame(one => (one + 1) % SPIN_FRAMES.length), 100)
 
     return () => clearInterval(timer)
-  }, [frame === null])
+  }, [busy === 0])
 
+  // A sticky flash stays until something replaces it.
   useEffect(() => {
-    if (!flash) {
+    if (!flash || flash.isSticky) {
       return
     }
     const timer = setTimeout(() => setFlash(null), 5000)
@@ -218,8 +292,10 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
 
   // Runs a GitHub action, says how it went and refreshes from GitHub when it worked.
   const runAction = async (work: Promise<Done>, after?: () => Promise<unknown>) => {
-    setFlash({ text: 'Working…' })
+    setFlash({ text: 'Working…', isSticky: true })
+    setBusy(count => count + 1)
     const result = await work
+    setBusy(count => count - 1)
     setFlash({ text: result.text, isError: !result.ok })
     if (result.ok) {
       await after?.()
@@ -231,8 +307,11 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
   const openPanel = async (kind: PanelKind, pr: PrRow | null, isRedo = false) => {
     setPanelOpen(true)
     setPanelTop(0)
+    if (!isRedo) {
+      setPanelPage(0)
+    }
     const isSame = panel?.kind === kind && panel.pr?.number === pr?.number && panel.pr?.repo === pr?.repo
-    // Threads come from the rows, so they are always rebuilt.
+    // Threads are acted on, so they are always fetched again.
     if (isSame && panel.status !== 'error' && !isRedo && kind !== 'threads') {
       return
     }
@@ -248,14 +327,24 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     setPanel({ kind, pr, status: 'loading', text: '', at })
     const streaming = { onText: (text: string) => write({ text }), signal: controller.signal }
     let result: ReportResult
-    if (kind === 'digest') {
+    if (kind === 'help') {
+      result = { text: HELP }
+    } else if (kind === 'digest') {
       const all = snapRef.current
       const rows = all ? [...all.rows, ...(all.current && !all.rows.some(one => rowKey(one) === rowKey(all.current!)) ? [all.current] : [])] : []
       result = await digest(rows.filter(one => one.state === 'OPEN'), all?.me ?? '', configs.current.current, streaming)
     } else if (!pr?.repo) {
       result = { failure: 'Unknown repository for this PR' }
     } else if (kind === 'threads') {
-      result = { text: threadsMarkdown(pr, localOffset()) }
+      const data = await fetchThreads(pr.repo, pr.number)
+      const me = snapRef.current?.me ?? ''
+      const context = { me, isMine: pr.isMine, automated: compileRegex(configFor(configs.current, pr.repo).automatedComments) }
+      const pages = data ? threadPages(data.threads, context).map(one => ({ ...one, text: threadMarkdown(one, me, localOffset()) })) : []
+      write({ pages })
+      result = data ? { text: pages.length === 0 ? 'No unresolved threads.' : '' } : { failure: 'Could not load the threads' }
+    } else if (kind === 'pr') {
+      const conversation = await fetchConversation(pr, localOffset())
+      result = 'failure' in conversation ? conversation : { text: conversationMarkdown(conversation) }
     } else if (kind === 'report') {
       result = await quickReport(pr.repo, pr.number, configFor(configs.current, pr.repo), streaming)
     } else {
@@ -274,26 +363,27 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
   // ---- What each PR offers, used by both the hints line and the keys.
   const canCheckout = (pr: PrRow) =>
     pr.state === 'OPEN' && !!scope.current.root && pr.repo === scope.current.repo && pr.headRef !== scope.current.branch
-  const keysFor = (pr: PrRow): [string, string][] => {
+  const keysFor = (pr: PrRow): [string, string, KeyGroup][] => {
     const isOpen = pr.state === 'OPEN'
-    const keys: [string, string | null][] = [
-      ['t', pr.replies && pr.replies.length > 0 ? `Threads (${pr.replies.length})` : null],
-      ['v', reviewLabel(pr) || null],
-      ['d', pr.rereview ? 'Changes' : null],
-      ['c', pr.state === 'MERGED' ? 'Clean' : null],
-      ['m', pr.bucket === 'ready' ? 'Merge' : null],
-      ['R', rerequestable(pr).length > 0 ? 'Re-request' : null],
-      ['b', isOpen && pr.isBehind ? 'Update' : null],
-      ['a', 'Ask'],
-      ['r', 'Report'],
-      ['s', pr.isNew ? 'Seen' : null],
-      ['z', isOpen ? (pr.bucket === 'snoozed' ? 'Unsnooze' : 'Snooze') : null],
-      ['Z', isOpen && pr.bucket !== 'snoozed' ? 'Till tomorrow' : null],
-      ['g', canCheckout(pr) ? 'Checkout' : null],
-      ['o', pr.url ? 'Open' : null],
+    const keys: [string, string | null, KeyGroup][] = [
+      ['v', reviewLabel(pr) || null, 'copy'],
+      ['a', 'Ask', 'copy'],
+      ['c', pr.state === 'MERGED' ? 'Clean' : null, 'copy'],
+      ['⏎', 'View', 'view'],
+      ['t', pr.unresolved ? 'Threads' : null, 'view'],
+      ['d', pr.rereview ? 'Changes' : null, 'view'],
+      ['r', 'Report', 'view'],
+      ['o', pr.url ? 'Open' : null, 'view'],
+      ['m', pr.bucket === 'ready' ? 'Merge' : null, 'change'],
+      ['R', rerequestable(pr).length > 0 ? 'Re-request' : null, 'change'],
+      ['b', isOpen && pr.isBehind ? 'Update' : null, 'change'],
+      ['g', canCheckout(pr) ? 'Checkout' : null, 'change'],
+      ['s', pr.isNew ? 'Seen' : null, 'mark'],
+      ['z', isOpen ? (pr.bucket === 'snoozed' ? 'Unsnooze' : 'Snooze') : null, 'mark'],
+      ['Z', isOpen && pr.bucket !== 'snoozed' ? 'Till tomorrow' : null, 'mark'],
     ]
 
-    return keys.filter((one): one is [string, string] => one[1] !== null)
+    return keys.filter((one): one is [string, string, KeyGroup] => one[1] !== null)
   }
 
   const onPrKey = (input: string, pr: PrRow) => {
@@ -305,6 +395,8 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     switch (input) {
       case 'v':
         return void act('review', pr)
+      case '⏎':
+        return void openPanel('pr', pr)
       case 't':
         return void openPanel('threads', pr)
       case 'd':
@@ -343,16 +435,19 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
   // ---- Layout: every line of the scrolling area, then the selectable items among them.
   const list = snap?.rows ?? []
   const current = snap?.current ?? null
-  const isAll = scope.current.isAll
+  const query = filter.trim().toLowerCase()
+  const matches = (pr: PrRow) => !query || `#${pr.number} ${pr.title} ${pr.author} ${pr.repo}`.toLowerCase().includes(query)
   const showWho = columns >= 90
   const showAge = columns >= 70
   const showRepo = isAll && columns >= 100
-  const groups = BUCKETS.map(one => ({ ...one, rows: list.filter(pr => pr.bucket === one.bucket) })).filter(one => one.rows.length > 0)
+  const groups = BUCKETS.map(one => ({ ...one, rows: list.filter(pr => pr.bucket === one.bucket && matches(pr)) })).filter(one => one.rows.length > 0)
+  // While filtering, folded groups open so every match shows.
+  const isFolded = (bucket: PrBucket) => collapsed.includes(bucket) && !query
   const items: Item[] = [
     ...(current ? [{ key: 'current', pr: current }] : []),
     ...groups.flatMap(({ bucket, rows }) => [
       { key: `bucket:${bucket}`, bucket },
-      ...(collapsed.includes(bucket) ? [] : rows.map(pr => ({ key: `row:${rowKey(pr)}`, pr }))),
+      ...(isFolded(bucket) ? [] : rows.map(pr => ({ key: `row:${rowKey(pr)}`, pr }))),
     ]),
   ]
   // The remembered selection while it still exists, otherwise the first PR.
@@ -360,8 +455,9 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
   pickedKey.current = picked?.key ?? null
   const lines: Line[] = []
 
-  const chip = (one: Chip, key: string) => (
-    <Text key={key} color={one.color ? COLORS[one.color] : undefined} dimColor={one.dim} wrap="truncate-end">
+  // On the selected row nothing is dim, so it stays readable on the highlight.
+  const chip = (one: Chip, key: string, isPicked = false) => (
+    <Text key={key} color={one.color ? COLORS[one.color] : undefined} dimColor={one.dim && !isPicked} wrap="truncate-end">
       {one.text}
     </Text>
   )
@@ -373,38 +469,38 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
   const isHere = (pr: PrRow, key: string) => key !== 'current' && !!current && current.number === pr.number && current.repo === pr.repo
 
   const rowLine = (pr: PrRow, key: string, isPicked: boolean): ReactNode => {
-    const marker = isPicked ? <Text bold>▸</Text> : pr.isNew ? <Text color="yellow">●</Text> : <Text> </Text>
     const extras = [...(isHere(pr, key) ? [{ text: '◉ here', dim: true }] : []), ...extraChips(pr)]
     const stale = staleness(pr, now)
 
     return (
-      <Box key={key}>
-        {cell(2, marker, 'marker')}
-        {showRepo && cell(16, <Text dimColor wrap="truncate-end">{pr.repo.split('/')[1]}</Text>, 'repo')}
+      <Box key={key} backgroundColor={isPicked ? 'gray' : undefined} flexGrow={1}>
+        {cell(1, <Text bold>{isPicked ? '▸' : ' '}</Text>, 'pointer')}
+        {cell(2, <Text color="yellow">{pr.isNew ? '●' : ' '}</Text>, 'new')}
+        {showRepo && cell(16, <Text dimColor={!isPicked} wrap="truncate-end">{pr.repo.split('/')[1]}</Text>, 'repo')}
         {cell(7, <Text bold={isPicked}>#{pr.number}</Text>, 'number')}
-        {cell(10, chip(reviewChip(pr), 'review'), 'review')}
-        {cell(8, chip(ciChip(pr), 'ci'), 'ci')}
-        {cell(4, chip(threadsChip(pr), 'threads'), 'threads')}
+        {cell(10, chip(reviewChip(pr), 'review', isPicked), 'review')}
+        {cell(8, chip(ciChip(pr), 'ci', isPicked), 'ci')}
+        {cell(4, chip(threadsChip(pr), 'threads', isPicked), 'threads')}
         <Box flexGrow={1} flexShrink={1} minWidth={0}>
-          <Text bold={pr.isNew || isPicked} dimColor={pr.bucket === 'snoozed'} wrap="truncate-end">
+          <Text bold={pr.isNew || isPicked} dimColor={pr.bucket === 'snoozed' && !isPicked} wrap="truncate-end">
             {pr.title}
           </Text>
         </Box>
         {extras.map((one, index) => (
           <Box key={`extra-${index}`} flexShrink={0} marginLeft={1}>
-            {chip(one, 'chip')}
+            {chip(one, 'chip', isPicked)}
           </Box>
         ))}
         {showWho && (
           <Box width={14} flexShrink={0} marginLeft={1}>
-            <Text dimColor wrap="truncate-end">
+            <Text dimColor={!isPicked} wrap="truncate-end">
               {pr.isMine ? 'you' : pr.author}
             </Text>
           </Box>
         )}
         {showAge && (
           <Box width={4} flexShrink={0} marginLeft={1} justifyContent="flex-end">
-            <Text color={stale ? COLORS[stale] : undefined} dimColor={!stale}>
+            <Text color={stale ? COLORS[stale] : undefined} dimColor={!stale && !isPicked}>
               {pr.lastOtherAt ? age(pr.lastOtherAt, now) : ''}
             </Text>
           </Box>
@@ -414,43 +510,14 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
   }
 
   const addRow = (pr: PrRow, key: string) => {
-    const isPicked = key === picked?.key
-    lines.push({ key, item: key, node: rowLine(pr, key, isPicked) })
-    if (isPicked) {
-      const where = isAll && !showRepo ? `${pr.repo}  ·  ` : ''
-      lines.push({
-        key: `${key}-detail`,
-        item: key,
-        node: (
-          <Box marginLeft={9}>
-            <Text dimColor wrap="truncate-end">
-              {where}
-              {detailOf(pr, now)}
-            </Text>
-          </Box>
-        ),
-      })
-      lines.push({
-        key: `${key}-actions`,
-        item: key,
-        node: (
-          <Box marginLeft={9}>
-            <Text color="cyan" wrap="truncate-end">
-              {keysFor(pr)
-                .map(([one, label]) => `${one} ${label}`)
-                .join('   ')}
-            </Text>
-          </Box>
-        ),
-      })
-    }
+    lines.push({ key, item: key, node: rowLine(pr, key, key === picked?.key) })
   }
 
   let header: ReactNode = null
   if (snap?.checkedAt && list.length > 0) {
     header = (
       <Box>
-        {cell(2, <Text> </Text>, 'marker')}
+        {cell(3, <Text> </Text>, 'marker')}
         {showRepo && cell(16, <Text dimColor>REPO</Text>, 'repo')}
         {cell(7, <Text dimColor>#</Text>, 'number')}
         {cell(10, <Text dimColor>REVIEW</Text>, 'review')}
@@ -466,7 +533,7 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     lines.push({ key: 'current-title', node: <Text dimColor>CURRENT BRANCH · {scope.current.branch}</Text> })
     addRow(current, 'current')
   }
-  if (snap?.checkedAt && list.every(pr => pr.bucket === 'others' || pr.bucket === 'snoozed')) {
+  if (snap?.checkedAt && !query && list.every(pr => pr.bucket === 'others' || pr.bucket === 'snoozed')) {
     lines.push({
       key: 'caught-up',
       node: (
@@ -477,38 +544,90 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
       ),
     })
   }
+  if (query && groups.length === 0) {
+    lines.push({ key: 'no-match', node: <Text dimColor>No PRs match “{filter.trim()}” · esc clears the filter</Text> })
+  }
   for (const { bucket, title, color, rows: group } of groups) {
     const key = `bucket:${bucket}`
-    const isFolded = collapsed.includes(bucket)
     lines.push({ key: `${key}-gap`, node: <Text> </Text> })
     lines.push({
       key,
       item: key,
       node: (
         <Text color={color} dimColor={!color} bold={key === picked?.key} inverse={key === picked?.key}>
-          {isFolded ? '▸' : '▾'} {title} · {group.length}
+          {isFolded(bucket) ? '▸' : '▾'} {title} · {group.length}
         </Text>
       ),
     })
-    if (!isFolded) {
+    if (!isFolded(bucket)) {
       for (const pr of group) {
         addRow(pr, `row:${rowKey(pr)}`)
       }
     }
   }
 
+  // ---- The selected item's details and keys, fixed above the footer so the list never shifts.
+  const details = (): ReactNode[] => {
+    const pr = picked?.pr
+    if (!pr) {
+      const hint = picked?.bucket ? `⏎ ${isFolded(picked.bucket) ? 'unfold' : 'fold'} this group` : ' '
+
+      return [<Text key="detail" dimColor>{hint}</Text>, <Text key="actions"> </Text>]
+    }
+    const where = isAll && !showRepo ? `${pr.repo}  ·  ` : ''
+    const who = showWho ? '' : `${pr.isMine ? 'you' : pr.author}  ·  `
+    const byGroup = KEY_GROUPS.map(group => keysFor(pr).filter(one => one[2] === group)).filter(one => one.length > 0)
+
+    return [
+      <Text key="detail" dimColor wrap="truncate-end">
+        {where}
+        {who}
+        {detailOf(pr, now)}
+      </Text>,
+      <Text key="actions" wrap="truncate-end">
+        {byGroup.map((keys, index) => (
+          <Text key={index}>
+            {index > 0 && <Text dimColor>{'  │  '}</Text>}
+            <Text color={keys[0]?.[2] === 'change' ? 'yellow' : 'cyan'}>{keys.map(([one, label]) => `${one} ${label}`).join('  ')}</Text>
+          </Text>
+        ))}
+      </Text>,
+    ]
+  }
+
   // ---- The panel, which replaces the list while open.
-  const panelLines = panel ? markdownLines(panel.text || ' ', columns - 2) : []
+  const pages = panel?.pages ?? []
+  const pageAt = Math.max(0, Math.min(panelPage, pages.length - 1))
+  const page = pages[pageAt]
+  const panelText = page?.text ?? panel?.text ?? ''
+  const panelLines = panel ? markdownLines(panelText || ' ', columns - 2) : []
   const panelRoom = Math.max(3, height - 5)
   const panelMax = Math.max(0, panelLines.length - panelRoom)
 
-  const onPanelKey = (input: string, key: { escape: boolean; downArrow: boolean; upArrow: boolean; pageDown: boolean; pageUp: boolean }) => {
+  type Key = {
+    escape: boolean
+    downArrow: boolean
+    upArrow: boolean
+    leftArrow: boolean
+    rightArrow: boolean
+    pageDown: boolean
+    pageUp: boolean
+    home: boolean
+    end: boolean
+  }
+
+  const onPanelKey = (input: string, key: Key) => {
     if (!panel) {
       return
     }
     const isDone = panel.status === 'done'
+    const isHelp = panel.kind === 'help'
     const pr = panel.pr
-    if (input === 'q' || key.escape) {
+    const turn = (to: number) => {
+      setPanelPage(Math.max(0, Math.min(pages.length - 1, to)))
+      setPanelTop(0)
+    }
+    if (input === 'q' || key.escape || (isHelp && input === '?')) {
       setPanelOpen(false)
     } else if (key.downArrow || input === 'j') {
       setPanelTop(top => Math.min(panelMax, top + 1))
@@ -516,20 +635,79 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
       setPanelTop(top => Math.max(0, top - 1))
     } else if (key.pageDown || input === ' ') {
       setPanelTop(top => Math.min(panelMax, top + panelRoom - 1))
-    } else if (key.pageUp) {
+    } else if (key.pageUp || input === 'b') {
       setPanelTop(top => Math.max(0, top - panelRoom + 1))
-    } else if (input === 'c' && isDone) {
-      void copy(panel.text).then(isCopied => setFlash(isCopied ? { text: 'Copied' } : { text: 'Could not copy', isError: true }))
-    } else if (input === 'x' && panel.status !== 'loading') {
+    } else if (key.home || input === 'g') {
+      setPanelTop(0)
+    } else if (key.end || input === 'G') {
+      setPanelTop(panelMax)
+    } else if (page && (key.rightArrow || input === 'n')) {
+      turn(pageAt + 1)
+    } else if (page && (key.leftArrow || input === 'p')) {
+      turn(pageAt - 1)
+    } else if (input === 'r' && page?.thread.canReply) {
+      setDraft({ thread: page.thread, text: '' })
+    } else if (input === 's' && pr && page?.thread.canResolve) {
+      const { thread } = page
+      setConfirm({
+        text: `Resolve the thread on ${thread.path}${thread.line ? `:${thread.line}` : ''}?`,
+        run: () => resolveThread(thread.id),
+        after: () => openPanel('threads', pr, true),
+      })
+    } else if (input === 'o' && page?.thread.url) {
+      openUrl(page.thread.url)
+    } else if (input === 'c' && isDone && !isHelp) {
+      void copy(panelText).then(isCopied => setFlash(isCopied ? { text: 'Copied' } : { text: 'Could not copy', isError: true }))
+    } else if (input === 'x' && panel.status !== 'loading' && !isHelp) {
       void openPanel(panel.kind, pr, true)
     } else if (input === 'o' && pr?.url) {
       openUrl(pr.url)
     } else if (input === 'a' && isDone && pr && panel.kind === 'report') {
       void act('ask', pr, panel.text)
+    } else if (input === 'a' && pr && panel.kind === 'pr') {
+      void act('ask', pr)
     } else if (input === 'a' && pr && panel.kind === 'threads' && pr.replies?.length) {
       void act('replies', pr)
-    } else if (input === 'v' && pr && panel.kind === 'changes' && reviewLabel(pr)) {
+    } else if (input === 'v' && pr && (panel.kind === 'changes' || panel.kind === 'pr') && reviewLabel(pr)) {
       void act('review', pr)
+    }
+  }
+
+  // Typing a reply: ⏎ posts it and shows the thread again, esc drops it.
+  const onDraftKey = (input: string, key: { escape: boolean; return: boolean; backspace: boolean; delete: boolean; ctrl: boolean; meta: boolean }) => {
+    if (!draft) {
+      return
+    }
+    if (key.escape) {
+      setDraft(null)
+      setFlash({ text: 'Reply discarded' })
+    } else if (key.return) {
+      const body = draft.text.trim()
+      const pr = panel?.pr
+      if (!body || !pr) {
+        return
+      }
+      setDraft(null)
+      void runAction(replyToThread(draft.thread.id, body), () => openPanel('threads', pr, true))
+    } else if (key.backspace || key.delete) {
+      setDraft({ ...draft, text: draft.text.slice(0, -1) })
+    } else if (input && !key.ctrl && !key.meta) {
+      // A pasted reply keeps its line breaks.
+      setDraft({ ...draft, text: draft.text + input.replace(/\r\n?/g, '\n') })
+    }
+  }
+
+  // Typing a filter: letters go to the filter, arrows still move, ⏎ keeps it and esc clears it.
+  const onFilterKey = (input: string, key: { escape: boolean; return: boolean; backspace: boolean; delete: boolean; ctrl: boolean; meta: boolean }) => {
+    if (key.escape) {
+      setFilter('')
+      setFiltering(false)
+    } else if (key.return) {
+      setFiltering(false)
+    } else if (key.backspace || key.delete) {
+      setFilter(text => text.slice(0, -1))
+    } else if (input && !key.ctrl && !key.meta) {
+      setFilter(text => text + input)
     }
   }
 
@@ -542,30 +720,20 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     if (confirm) {
       setConfirm(null)
       if (input === 'y') {
-        void runAction(confirm.run())
+        void runAction(confirm.run(), confirm.after)
       } else {
         setFlash({ text: 'Cancelled' })
       }
 
       return
     }
+    if (draft) {
+      onDraftKey(input, key)
+
+      return
+    }
     if (isPanelOpen) {
       onPanelKey(input, key)
-
-      return
-    }
-    if (input === 'q' || key.escape) {
-      exit()
-
-      return
-    }
-    if (input === 'u') {
-      void load({ maxAgeMs: 0, canFetch: true }, { force: true })
-
-      return
-    }
-    if (input === 'D') {
-      void openPanel('digest', null)
 
       return
     }
@@ -575,14 +743,31 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
       pickedKey.current = items[to]?.key ?? null
       setSelected(pickedKey.current)
     }
-    if (key.downArrow || input === 'j') {
+    if (key.downArrow || (!isFiltering && input === 'j')) {
       move(Math.min(items.length - 1, index + 1))
-    } else if (key.upArrow || input === 'k') {
+    } else if (key.upArrow || (!isFiltering && input === 'k')) {
       move(Math.max(0, index - 1))
+    } else if (isFiltering) {
+      onFilterKey(input, key)
+    } else if (input === 'q') {
+      exit()
+    } else if (key.escape) {
+      // esc never quits, so leaving a panel with one esc too many is harmless.
+      setFilter('')
+    } else if (input === '/') {
+      setFiltering(true)
+    } else if (input === '?') {
+      void openPanel('help', null)
+    } else if (input === 'A') {
+      toggleScope()
+    } else if (input === 'u') {
+      void load({ maxAgeMs: 0, canFetch: true }, { force: true })
+    } else if (input === 'D') {
+      void openPanel('digest', null)
     } else if (at?.bucket && (key.return || input === ' ')) {
       void toggleBucket(at.bucket)
     } else if (at?.pr) {
-      onPrKey(input, at.pr)
+      onPrKey(key.return ? '⏎' : input, at.pr)
     }
   })
 
@@ -590,7 +775,11 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     <Box key="footer" flexDirection="column">
       {confirm ? (
         <Text color="yellow" wrap="truncate-end">
-          {confirm.text} y / n
+          {confirm.text} <Text bold>y</Text> confirm · any other key cancels
+        </Text>
+      ) : draft ? (
+        <Text color="cyan" wrap="truncate-start">
+          Reply › {draft.text.replace(/\n/g, ' ⏎ ')}▏
         </Text>
       ) : (
         <Text color={flash?.isError ? 'red' : 'green'} wrap="truncate-end">
@@ -598,25 +787,30 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
         </Text>
       )}
       <Text dimColor wrap="truncate-end">
-        {keys}
+        {draft ? `replying on ${draft.thread.path}${draft.thread.line ? `:${draft.thread.line}` : ''} · ⏎ post · esc cancel` : keys}
       </Text>
     </Box>
   )
 
   if (isPanelOpen && panel) {
     const { kind, pr, status } = panel
-    const model = kind === 'changes' || kind === 'threads' ? '' : configFor(configs.current, pr?.repo ?? '').reportModel
-    const meta = [model, status === 'loading' ? 'loading…' : status === 'done' ? ago(new Date(panel.at).toISOString(), now) : ''].filter(Boolean).join(' · ')
-    const names = { report: 'Report', changes: 'Changes since my review', threads: 'Threads waiting for your reply', digest: '' }
-    const title = kind === 'digest' ? 'Digest · what to do first' : `${names[kind]} · #${pr?.number} ${pr?.title}`
+    const isHelp = kind === 'help'
+    const model = kind === 'report' || kind === 'digest' ? configFor(configs.current, pr?.repo ?? '').reportModel : ''
+    const meta = isHelp ? '' : [model, status === 'loading' ? 'loading…' : status === 'done' ? ago(new Date(panel.at).toISOString(), now) : ''].filter(Boolean).join(' · ')
+    const names = { pr: 'PR', report: 'Report', changes: 'Changes since my review', threads: 'Threads' }
+    const title = kind === 'digest' ? 'Digest · what to do first' : kind === 'help' ? 'Keys and symbols' : `${names[kind]} · #${pr?.number} ${pr?.title}`
     const keys = [
       '↑↓ scroll',
       status === 'done' && kind === 'report' ? 'a Ask with report' : null,
+      kind === 'pr' ? 'a Ask' : null,
+      pages.length > 1 ? '←→ thread' : null,
+      page?.thread.canReply ? 'r Reply' : null,
+      page?.thread.canResolve ? 's Resolve' : null,
       kind === 'threads' && pr?.replies?.length ? 'a Draft replies' : null,
-      kind === 'changes' && pr && reviewLabel(pr) ? `v ${reviewLabel(pr)}` : null,
-      status === 'done' ? 'c Copy' : null,
+      (kind === 'changes' || kind === 'pr') && pr && reviewLabel(pr) ? `v ${reviewLabel(pr)}` : null,
+      status === 'done' && !isHelp ? 'c Copy' : null,
       pr?.url ? 'o Open' : null,
-      status !== 'loading' ? 'x Redo' : null,
+      status !== 'loading' && !isHelp ? 'x Redo' : null,
       'esc back',
     ]
 
@@ -625,7 +819,11 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
         height={height}
         title={title}
         meta={meta}
-        subtitle={pr?.repo ?? (isAll ? 'all repos' : (scope.current.repo ?? ''))}
+        subtitle={
+          isHelp
+            ? ''
+            : [pr?.repo ?? (isAll ? 'all repos' : (scope.current.repo ?? '')), page ? `thread ${pageAt + 1} of ${pages.length}` : ''].filter(Boolean).join(' · ')
+        }
         error={status === 'error' ? panel.text : undefined}
         placeholder={status === 'loading' && !panel.text ? (kind === 'digest' ? 'Weighing your PRs…' : 'Reading the PR…') : undefined}
         body={panelLines}
@@ -638,7 +836,7 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
 
   // ---- Fixed top and bottom lines around the scrolling area.
   const top: ReactNode[] = []
-  const spinner = frame === null ? '↻' : (SPIN_FRAMES[frame] ?? '↻')
+  const spinner = busy > 0 ? (SPIN_FRAMES[frame] ?? '↻') : '↻'
   const where = isAll ? 'all repos' : (scope.current.repo ?? 'this repo')
   top.push(
     <Box key="title">
@@ -652,7 +850,7 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
           </Text>
         </Text>
       </Box>
-      <Text dimColor={frame === null}>{spinner}</Text>
+      <Text dimColor={busy === 0}>{spinner}</Text>
     </Box>,
   )
   if (snap?.error) {
@@ -669,12 +867,20 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
       </Text>,
     )
   }
+  if (isFiltering || filter) {
+    top.push(
+      <Text key="filter" color="cyan" wrap="truncate-end">
+        / {filter}
+        {isFiltering ? '▏' : ''}
+      </Text>,
+    )
+  }
   if (header) {
     top.push(<Box key="header">{header}</Box>)
   }
 
-  // Scroll just enough to keep every line of the selected item in view.
-  const room = Math.max(3, height - top.length - 2)
+  // Scroll just enough to keep the selected item in view; the details area and the footer take five lines.
+  const room = Math.max(3, height - top.length - 5)
   const first = lines.findIndex(line => line.item === picked?.key)
   const last = lines.findLastIndex(line => line.item === picked?.key)
   if (first >= 0 && first < offset.current) {
@@ -683,6 +889,15 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     offset.current = last - room + 1
   }
   offset.current = Math.max(0, Math.min(offset.current, lines.length - room))
+  const keys = isFiltering
+    ? 'type to filter by number, title, author or repo · ↑↓ move · ⏎ keep · esc clear'
+    : [
+        '↑↓ move · ⏎ fold / view · / filter',
+        isAll && !scope.current.repo ? null : `A ${isAll ? 'this repo' : 'all repos'}`,
+        'D digest · u refresh · ? keys · q quit',
+      ]
+        .filter(Boolean)
+        .join(' · ')
 
   return (
     <Box flexDirection="column" height={height}>
@@ -692,7 +907,10 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
           <Box key={line.key}>{line.node}</Box>
         ))}
       </Box>
-      {footer('↑↓ move · ⏎ fold · D digest · u refresh · q quit')}
+      <Box flexDirection="column" borderStyle="single" borderDimColor borderBottom={false} borderLeft={false} borderRight={false} paddingLeft={3}>
+        {details()}
+      </Box>
+      {footer(keys)}
     </Box>
   )
 }

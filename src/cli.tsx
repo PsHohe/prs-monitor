@@ -7,7 +7,7 @@ import type { PrRow } from './types'
 import { digest, quickReport } from './ai'
 import type { ReportResult } from './ai'
 import { readState, updateState } from './github'
-import { ago, alertOf, ciChip, extraChips, reviewChip, threadsChip } from './lib/lib'
+import { age, ago, alertOf, ciChip, extraChips, reviewChip, staleness, threadsChip } from './lib/lib'
 import type { Chip } from './lib/lib'
 import { configFor, detectScope, loadConfigs, refresh } from './monitor'
 import type { Snapshot } from './monitor'
@@ -144,6 +144,9 @@ function printList(snap: Snapshot): void {
     { bucket: 'others', title: 'WAITING ON OTHERS' },
     { bucket: 'snoozed', title: 'SNOOZED' },
   ] as const
+  // The same columns as the interactive view; titles are cut to the terminal's width only on a terminal.
+  const width = process.stdout.isTTY ? process.stdout.columns : null
+  const repoWidth = scope.isAll ? Math.max(0, ...snap.rows.map(pr => shortRepo(pr).length)) + 2 : 0
   for (const { bucket, title } of groups) {
     const group = snap.rows.filter(pr => pr.bucket === bucket)
     if (group.length === 0) {
@@ -151,11 +154,38 @@ function printList(snap: Snapshot): void {
     }
     console.log(`\n${title} · ${group.length}`)
     for (const pr of group) {
-      const where = scope.isAll ? `${pr.repo}` : ''
-      const here = snap.current?.number === pr.number && snap.current.repo === pr.repo ? ' ◉' : ''
-      console.log(`${pr.isNew ? '●' : ' '} ${where}#${pr.number}${here}  ${pr.title}  [${chips(pr)}]  ${pr.isMine ? 'you' : pr.author}`)
+      const isHere = snap.current?.number === pr.number && snap.current.repo === pr.repo
+      const head: [Chip, number][] = [
+        [{ text: pr.isNew ? '●' : '', color: 'warning' }, 2],
+        [{ text: scope.isAll ? shortRepo(pr) : '', dim: true }, repoWidth],
+        [{ text: `#${pr.number}` }, 7],
+        [reviewChip(pr), 10],
+        [ciChip(pr), 8],
+        [threadsChip(pr), 4],
+      ]
+      const tail: Chip[] = [...(isHere ? [{ text: '◉ here', dim: true }] : []), ...extraChips(pr)]
+      const stale = staleness(pr, now)
+      const who: Chip = { text: (pr.isMine ? 'you' : pr.author).slice(0, 13).padEnd(14), dim: true }
+      const when: Chip = { text: (pr.lastOtherAt ? age(pr.lastOtherAt, now) : '').padStart(4), ...(stale ? { color: stale } : { dim: true }) }
+      const tailText = tail.map(one => one.text).join('  ')
+      const fixed = head.reduce((sum, [, size]) => sum + size, 0) + (tailText ? tailText.length + 2 : 0) + 20
+      const room = width ? Math.max(10, width - fixed - 1) : null
+      const name = room && pr.title.length > room ? `${pr.title.slice(0, room - 1)}…` : pr.title
+      console.log(
+        [
+          head.map(([one, size]) => paint({ ...one, text: one.text.padEnd(size) })).join(''),
+          room ? name.padEnd(room) : name,
+          tailText ? `  ${tail.map(paint).join('  ')}` : '',
+          '  ',
+          `${paint(who)} ${paint(when)}`,
+        ].join(''),
+      )
     }
   }
+}
+
+function shortRepo(pr: PrRow): string {
+  return pr.repo.split('/')[1] ?? pr.repo
 }
 
 // Prints text as it streams in, then exits: 1 with the reason when there is no answer.

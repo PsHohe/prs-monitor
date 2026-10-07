@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path'
 
 import type { PrRow } from './types'
 import { isRateLimited, parseCache } from './lib/lib'
-import type { ChangesData, GqlPr, MergedPr, PrThreads, ReviewThread, SharedCache, Snooze, ThreadSummary } from './lib/lib'
+import type { ChangesData, Conversation, GqlPr, MergedPr, PrThreads, SharedCache, Snooze, ThreadDetail, ThreadSummary } from './lib/lib'
 
 export type RunResult = { exitCode: number; stdout: string; stderr: string }
 
@@ -256,15 +256,16 @@ export async function updateState(patch: Partial<Omit<CliState, 'snoozed'>> & { 
   return next
 }
 
-// Fetched when Re-review is pressed: our threads with their replies, and our last review's summary.
+// Fetched when Re-review is pressed or the threads are viewed: the threads with their replies, and the reviews' summaries.
 const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       headRefOid
       reviews(last: 30) { nodes { author { login } state body submittedAt } }
       reviewThreads(first: 100) { nodes {
-        isResolved isOutdated path line originalLine
-        comments(first: 20) { nodes { author { login } body createdAt } }
+        id isResolved isOutdated path line originalLine viewerCanReply viewerCanResolve
+        hunk: comments(first: 1) { nodes { diffHunk } }
+        comments(first: 20) { nodes { author { login } body createdAt url } }
       } }
     }
   }
@@ -273,7 +274,7 @@ const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
 export type Threads = {
   headOid: string
   reviews: { author: string; body: string; at: string }[]
-  threads: ReviewThread[]
+  threads: ThreadDetail[]
 }
 
 export async function fetchThreads(repo: string, number: number): Promise<Threads | null> {
@@ -288,12 +289,16 @@ export async function fetchThreads(repo: string, number: number): Promise<Thread
     reviews: { nodes: { author: Author; state: string; body: string; submittedAt: string }[] }
     reviewThreads: {
       nodes: {
+        id: string
         isResolved: boolean
         isOutdated: boolean
         path: string
         line: number | null
         originalLine: number | null
-        comments: { nodes: { author: Author; body: string; createdAt: string }[] }
+        viewerCanReply: boolean
+        viewerCanResolve: boolean
+        hunk: { nodes: { diffHunk: string }[] }
+        comments: { nodes: { author: Author; body: string; createdAt: string; url: string }[] }
       }[]
     }
   }
@@ -303,11 +308,16 @@ export async function fetchThreads(repo: string, number: number): Promise<Thread
     headOid: data.headRefOid,
     reviews: data.reviews.nodes.map(r => ({ author: r.author?.login ?? '', body: r.body, at: r.submittedAt })),
     threads: data.reviewThreads.nodes.map(thread => ({
+      id: thread.id,
       path: thread.path,
       line: thread.line ?? thread.originalLine,
       isResolved: thread.isResolved,
       isOutdated: thread.isOutdated,
       comments: thread.comments.nodes.map(c => ({ author: c.author?.login ?? 'someone', body: c.body, at: c.createdAt })),
+      diffHunk: thread.hunk.nodes[0]?.diffHunk ?? '',
+      url: thread.comments.nodes.at(-1)?.url ?? '',
+      canReply: thread.viewerCanReply,
+      canResolve: thread.viewerCanResolve,
     })),
   }
 }
@@ -355,6 +365,65 @@ export async function fetchChanges(pr: PrRow, offsetMinutes: number): Promise<Ch
   return { pr, since: { at: since.at, oid: since.oid }, commits, files, prFiles: [], offsetMinutes }
 }
 
+// The PR's description and whole discussion, for the PR view. Fetched only when asked, about 1 point.
+const CONVERSATION_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      body createdAt additions deletions changedFiles commits { totalCount }
+      comments(first: 100) { nodes { author { login } body createdAt } }
+      reviews(first: 100) { nodes { author { login } state body submittedAt } }
+      reviewThreads(first: 100) { nodes {
+        isResolved isOutdated path line originalLine
+        comments(first: 50) { nodes { author { login } body createdAt } }
+      } }
+    }
+  }
+}`
+
+export async function fetchConversation(pr: PrRow, offsetMinutes: number): Promise<Conversation | { failure: string }> {
+  const [owner = '', name = ''] = pr.repo.split('/')
+  const result = await gh(['api', 'graphql', '-f', `query=${CONVERSATION_QUERY}`, '-f', `owner=${owner}`, '-f', `name=${name}`, '-F', `number=${pr.number}`])
+  if (result.exitCode !== 0) {
+    return { failure: result.stderr.trim() || 'gh api graphql failed' }
+  }
+  type Author = { login?: string } | null
+  type Comment = { author: Author; body: string; createdAt: string }
+  type Data = {
+    body: string
+    createdAt: string
+    additions: number
+    deletions: number
+    changedFiles: number
+    commits: { totalCount: number }
+    comments: { nodes: Comment[] }
+    reviews: { nodes: { author: Author; state: string; body: string; submittedAt: string | null }[] }
+    reviewThreads: { nodes: { isResolved: boolean; isOutdated: boolean; path: string; line: number | null; originalLine: number | null; comments: { nodes: Comment[] } }[] }
+  }
+  const data = (JSON.parse(result.stdout) as { data: { repository: { pullRequest: Data } } }).data.repository.pullRequest
+  const comment = (c: Comment) => ({ author: c.author?.login ?? 'someone', body: c.body, at: c.createdAt })
+
+  return {
+    pr,
+    body: data.body,
+    createdAt: data.createdAt,
+    additions: data.additions,
+    deletions: data.deletions,
+    changedFiles: data.changedFiles,
+    commits: data.commits.totalCount,
+    comments: data.comments.nodes.map(comment),
+    reviews: data.reviews.nodes.map(r => ({ author: r.author?.login ?? 'someone', state: r.state, body: r.body, at: r.submittedAt })),
+    threads: data.reviewThreads.nodes.map(thread => ({
+      path: thread.path,
+      line: thread.line ?? thread.originalLine,
+      isResolved: thread.isResolved,
+      isOutdated: thread.isOutdated,
+      comments: thread.comments.nodes.map(comment),
+      at: thread.comments.nodes[0]?.createdAt ?? '',
+    })),
+    offsetMinutes,
+  }
+}
+
 export type Done = { ok: boolean; text: string }
 
 function done(result: RunResult, success: string): Done {
@@ -380,4 +449,16 @@ export async function rerequestReview(pr: PrRow, logins: string[]): Promise<Done
     await gh(['api', '-X', 'POST', `repos/${pr.repo}/pulls/${pr.number}/requested_reviewers`, ...reviewers, '--silent']),
     `Asked ${logins.join(', ')} to review #${pr.number} again`,
   )
+}
+
+export async function replyToThread(threadId: string, body: string): Promise<Done> {
+  const query = 'mutation($id: ID!, $body: String!) { addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $id, body: $body }) { comment { id } } }'
+
+  return done(await gh(['api', 'graphql', '-f', `query=${query}`, '-f', `id=${threadId}`, '-f', `body=${body}`]), 'Reply posted')
+}
+
+export async function resolveThread(threadId: string): Promise<Done> {
+  const query = 'mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { isResolved } } }'
+
+  return done(await gh(['api', 'graphql', '-f', `query=${query}`, '-f', `id=${threadId}`]), 'Thread resolved')
 }

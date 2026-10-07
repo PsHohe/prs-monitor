@@ -102,7 +102,7 @@ export async function refresh(
   { maxAgeMs, canFetch }: RefreshOptions,
 ): Promise<Snapshot> {
   if (!scope.isAll && !scope.repo) {
-    return { ...EMPTY, error: scope.root ? 'gh could not read this repository' : 'not inside a git repository (try --all)' }
+    return { ...EMPTY, error: scope.root ? 'this repository has no GitHub remote gh can read (try --all)' : 'not inside a git repository (try --all)' }
   }
   const now = Date.now()
   const path = cachePath(scope.isAll ? null : scope.repo)
@@ -217,8 +217,12 @@ async function threadDetails(
       kept[key] = one
     }
   }
-  // Nodes from the plugin's cache have no updatedAt; then only missing details are fetched.
-  const stale = wanted.filter(({ key, node }) => !kept[key] || (!!node.updatedAt && kept[key].updatedAt !== node.updatedAt))
+  // Nodes from the plugin's cache have no updatedAt; then only missing details are fetched. Resolving a
+  // thread may leave updatedAt as it was, so a different count of unresolved threads also refetches.
+  const unresolvedOf = (node: GqlPr) => (node.reviewThreads?.nodes ?? []).filter(thread => !thread.isResolved).length
+  const stale = wanted.filter(
+    ({ key, node }) => !kept[key] || (!!node.updatedAt && kept[key].updatedAt !== node.updatedAt) || kept[key].unresolved.length !== unresolvedOf(node),
+  )
   if (stale.length === 0 || !mayAsk) {
     return kept
   }

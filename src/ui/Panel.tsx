@@ -17,7 +17,7 @@ type Props = {
 
 // A full-screen scrollable text panel (report, changes, digest) with the list's footer.
 export function Panel({ height, title, meta, subtitle, error, placeholder, body, top, room, footer }: Props) {
-  const range = body.length > room ? ` · lines ${top + 1}-${Math.min(body.length, top + room)} of ${body.length}` : ''
+  const range = body.length > room ? `lines ${top + 1}-${Math.min(body.length, top + room)} of ${body.length}` : ''
 
   return (
     <Box flexDirection="column" height={height}>
@@ -32,8 +32,7 @@ export function Panel({ height, title, meta, subtitle, error, placeholder, body,
         </Box>
       </Box>
       <Text dimColor wrap="truncate-end">
-        {subtitle}
-        {range}
+        {[subtitle, range].filter(Boolean).join(' · ') || ' '}
       </Text>
       <Box flexDirection="column" flexGrow={1} paddingLeft={1}>
         {error ? (

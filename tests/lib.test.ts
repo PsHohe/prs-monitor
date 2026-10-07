@@ -358,7 +358,7 @@ test('a PR we reviewed offers a re-review once the author pushes or replies', ()
     PLAIN,
   )
   expect(pushed.rereview).toEqual({ at: '2026-10-05T10:00:00Z', state: 'CHANGES_REQUESTED', oid: 'a1b2c3d4e5', commits: 2, isReplied: false })
-  expect(extraChips(pushed)).toContainEqual({ text: 'Δ 2 commits', color: 'warning' })
+  expect(extraChips(pushed)).toContainEqual({ text: 'Δ2', color: 'warning' })
 
   const replied = toRow(
     theirs({ comments: [{ author: { login: 'dev' }, body: 'fixed', createdAt: '2026-10-06T09:00:00Z' }] }),

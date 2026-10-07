@@ -15,11 +15,12 @@ prs report 425      # AI status report (or owner/name#425 from anywhere)
 prs digest [--all]  # AI summary of what to do first
 ```
 
-In the view: `↑↓`/`jk` move, `⏎` folds a group, `D` opens the digest, `u` refreshes, `q` quits. On a PR (the line under the selected PR lists the keys that apply):
+In the view: `↑↓`/`jk` move, `⏎` folds a group (on a PR, opens it), `/` filters by number, title, author or repo (`esc` clears it), `A` switches between this repo and all repos, `D` opens the digest, `u` refreshes, `?` lists every key and symbol, `q` quits. On a PR (the area above the footer shows its details and the keys that apply, grouped as copy │ view │ change │ mark, with the keys that change GitHub or git in yellow):
 
 | Key | Does |
 | --- | --- |
-| `t` | Threads waiting for your reply (`↩ N`); in it `a` copies a prompt to draft the replies |
+| `⏎` | View the PR: its description, then every comment, review and review thread (with replies) in order; in it `a` copies Ask and `v` Review / Re-review |
+| `t` | Unresolved review threads, one per page, those waiting for your reply first: why it waits on you, the code it's on and every comment. In it `←→` switch thread, `r` replies (`⏎` posts), `s` resolves (asks first), `o` opens the thread on GitHub, `a` copies a prompt to draft the replies |
 | `v` | Review / Re-review: copies a review prompt (Re-review includes your earlier threads) |
 | `d` | Changes since your review: the new commits and the PR's files they touched |
 | `a` | Ask: copies a prompt asking Claude's opinion on the PR |
@@ -33,7 +34,7 @@ In the view: `↑↓`/`jk` move, `⏎` folds a group, `D` opens the digest, `u` 
 | `z` / `Z` | Snooze until new activity / until 9:00 tomorrow or new activity; `z` again wakes it |
 | `o` | Opens the PR in the browser |
 
-Panels (report, changes, digest) scroll with `↑↓`/space; `c` copies, `x` redoes, `esc` goes back.
+Panels (report, changes, digest) scroll with `↑↓`, `space`/`b` page, `g`/`G` jump to the top or bottom; `c` copies, `x` redoes, `esc` goes back.
 
 Prompts go to the clipboard: paste them into whichever Claude session you want. In "waiting on me" the age turns yellow after a day and red after three.
 
