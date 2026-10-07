@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "bin": {
-    "prs": "src/cli.ts"
+    "prs": "src/cli.tsx"
   },
   "scripts": {
     "test": "bun test",
@@ -12,6 +12,11 @@
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",
+    "@types/react": "^19.3.0",
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "ink": "^8.0.0",
+    "react": "^19.3.0"
   }
 }

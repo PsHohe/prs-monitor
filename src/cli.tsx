@@ -1,17 +1,21 @@
 #!/usr/bin/env bun
 import { parseArgs } from 'node:util'
 
+import { render } from 'ink'
+
 import type { PrRow } from './types'
 import { readState } from './github'
 import { ago, alertOf, ciChip, extraChips, reviewChip, threadsChip } from './lib/lib'
 import type { Chip } from './lib/lib'
 import { detectScope, loadConfig, refresh } from './monitor'
 import type { Snapshot } from './monitor'
+import { App } from './ui/App'
 
 const USAGE = `Usage: prs [command] [options]
 
 Commands:
-  (none)    List open PRs involving you
+  (none)    Interactive view of open PRs involving you
+  list      Print them once
   status    One-line summary for a status line; reads only the cache unless --fetch
 
 Options:
@@ -30,15 +34,22 @@ const { values, positionals } = parseArgs({
   },
 })
 
-const command = positionals[0] ?? 'list'
-if (values.help || !['list', 'status'].includes(command)) {
+const command = positionals[0] ?? (process.stdout.isTTY && process.stdin.isTTY ? 'view' : 'list')
+if (values.help || !['view', 'list', 'status'].includes(command)) {
   console.log(USAGE)
   process.exit(values.help ? 0 : 1)
 }
 
 const scope = await detectScope(values.all)
 const config = await loadConfig(scope.root)
-const { seen } = await readState()
+const { seen, collapsed } = await readState()
+if (command === 'view') {
+  const app = render(<App initialScope={scope} initialConfig={config} initialSeen={seen} initialCollapsed={collapsed} />, {
+    alternateScreen: true,
+  })
+  await app.waitUntilExit()
+  process.exit(0)
+}
 const pollMs = config.pollMinutes * 60 * 1000
 const snapshot =
   command === 'status'

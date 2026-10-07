@@ -3,7 +3,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { isRateLimited, parseCache } from './lib/lib'
-import type { GqlPr, MergedPr, SharedCache } from './lib/lib'
+import type { GqlPr, MergedPr, ReviewThread, SharedCache } from './lib/lib'
 
 export type RunResult = { exitCode: number; stdout: string; stderr: string }
 
@@ -164,4 +164,60 @@ export async function readState(): Promise<CliState> {
 export async function writeState(state: CliState): Promise<void> {
   await mkdir(STATE_DIR, { recursive: true })
   await Bun.write(STATE_PATH, JSON.stringify(state))
+}
+
+// Fetched when Re-review is pressed: our threads with their replies, and our last review's summary.
+const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      reviews(last: 30) { nodes { author { login } state body submittedAt } }
+      reviewThreads(first: 100) { nodes {
+        isResolved isOutdated path line originalLine
+        comments(first: 20) { nodes { author { login } body createdAt } }
+      } }
+    }
+  }
+}`
+
+export type Threads = {
+  headOid: string
+  reviews: { author: string; body: string; at: string }[]
+  threads: ReviewThread[]
+}
+
+export async function fetchThreads(repo: string, number: number): Promise<Threads | null> {
+  const [owner = '', name = ''] = repo.split('/')
+  const result = await gh(['api', 'graphql', '-f', `query=${THREADS_QUERY}`, '-f', `owner=${owner}`, '-f', `name=${name}`, '-F', `number=${number}`])
+  if (result.exitCode !== 0) {
+    return null
+  }
+  type Author = { login?: string } | null
+  type Data = {
+    headRefOid: string
+    reviews: { nodes: { author: Author; state: string; body: string; submittedAt: string }[] }
+    reviewThreads: {
+      nodes: {
+        isResolved: boolean
+        isOutdated: boolean
+        path: string
+        line: number | null
+        originalLine: number | null
+        comments: { nodes: { author: Author; body: string; createdAt: string }[] }
+      }[]
+    }
+  }
+  const data = (JSON.parse(result.stdout) as { data: { repository: { pullRequest: Data } } }).data.repository.pullRequest
+
+  return {
+    headOid: data.headRefOid,
+    reviews: data.reviews.nodes.map(r => ({ author: r.author?.login ?? '', body: r.body, at: r.submittedAt })),
+    threads: data.reviewThreads.nodes.map(thread => ({
+      path: thread.path,
+      line: thread.line ?? thread.originalLine,
+      isResolved: thread.isResolved,
+      isOutdated: thread.isOutdated,
+      comments: thread.comments.nodes.map(c => ({ author: c.author?.login ?? 'someone', body: c.body, at: c.createdAt })),
+    })),
+  }
 }
