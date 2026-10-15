@@ -3,7 +3,10 @@ import type { PrBucket, PrCi, PrRow } from '../types'
 export type Config = {
   pollMinutes: number
   onNewReview: 'notify' | 'ask'
+  reportProvider: ReportProvider
+  // The Claude model; Codex has its own key so a repo's Claude model never reaches Codex. '' is Codex's default.
   reportModel: string
+  codexModel: string
   automatedComments: string | null
   ticketPattern: string | null
   twinBases: string[]
@@ -12,10 +15,15 @@ export type Config = {
   sections: Record<string, string>
 }
 
+export type ReportProvider = 'claude' | 'codex'
+export const REPORT_PROVIDERS: ReportProvider[] = ['claude', 'codex']
+
 export const DEFAULT_CONFIG: Config = {
   pollMinutes: 3,
   onNewReview: 'notify',
+  reportProvider: 'claude',
   reportModel: 'sonnet',
+  codexModel: '',
   automatedComments: null,
   ticketPattern: null,
   twinBases: [],
@@ -63,6 +71,34 @@ export function parseConfigFile(text: string): ConfigFile {
   return { values, sections }
 }
 
+// The file with these frontmatter keys set: each existing line is replaced in place, new keys go at the
+// end of the frontmatter (made if missing), and an empty value removes the key.
+export function setFrontmatter(text: string, values: Record<string, string>): string {
+  const front = /^---\r?\n(?:([\s\S]*?)\r?\n)?---\r?\n?/.exec(text)
+  const body = front ? text.slice(front[0].length) : text
+  const lines = front?.[1] ? front[1].split(/\r?\n/) : []
+  for (const [key, value] of Object.entries(values)) {
+    const index = lines.findIndex(line => new RegExp(`^${key}\\s*:`).test(line))
+    const line = `${key}: ${value}`
+    if (index < 0) {
+      if (value) {
+        lines.push(line)
+      }
+    } else if (value) {
+      lines[index] = line
+    } else {
+      lines.splice(index, 1)
+    }
+  }
+
+  return lines.length > 0 ? `---\n${lines.join('\n')}\n---\n${body}` : body
+}
+
+// The model a report uses, as shown next to it.
+export function reportModelLabel(config: Config): string {
+  return config.reportProvider === 'codex' ? `codex · ${config.codexModel || 'default'}` : config.reportModel
+}
+
 function minutes(raw: string | undefined): number | null {
   const match = raw ? /^(\d+(?:\.\d+)?)\s*(m|min|minutes?)?$/i.exec(raw) : null
 
@@ -86,11 +122,14 @@ export function mergeConfig(files: ConfigFile[]): Config {
     const v = file.values
     const review = v.on_new_review
     const merge = v.merge_method
+    const provider = v.report_provider
 
     return {
       pollMinutes: minutes(v.poll_interval) ?? config.pollMinutes,
       onNewReview: review === 'ask' || review === 'notify' ? review : config.onNewReview,
+      reportProvider: provider === 'claude' || provider === 'codex' ? provider : config.reportProvider,
       reportModel: v.report_model || config.reportModel,
+      codexModel: v.codex_model ?? config.codexModel,
       automatedComments: v.automated_comments ?? config.automatedComments,
       ticketPattern: v.ticket_pattern ?? config.ticketPattern,
       twinBases: list(v.twin_bases) ?? config.twinBases,
@@ -1140,4 +1179,182 @@ export function threadMarkdown(page: { thread: ThreadDetail; isOwed: boolean }, 
   }
 
   return lines.join('\n').trimEnd()
+}
+
+// One open PR for the team view: who wrote it, who is asked to review it and since when, and each reviewer's reviews.
+export type TeamPr = {
+  repo: string
+  number: number
+  title: string
+  author: string
+  isDraft: boolean
+  createdAt: string
+  requested: { login: string; at: string }[]
+  reviews: { login: string; state: string; at: string }[]
+}
+
+export type TeamState = 'requested' | 'changes' | 'commented' | 'approved'
+export type TeamWait = { reviewer: string; pr: TeamPr; since: string }
+
+// Who reviews whom across the open PRs (drafts left out): one cell per reviewer and author, with the most urgent state.
+export type Team = {
+  people: string[]
+  cells: Record<string, Record<string, { state: TeamState; count: number }>>
+  // Review requests waiting on each reviewer, oldest first across everyone.
+  waiting: TeamWait[]
+  open: Record<string, number>
+  // PRs with no reviewer requested and no review yet.
+  unreviewed: TeamPr[]
+  drafts: number
+}
+
+const TEAM_URGENCY: TeamState[] = ['requested', 'changes', 'commented', 'approved']
+// A request older than this is flagged.
+const TEAM_OVERDUE_MS = 2 * 24 * 60 * 60 * 1000
+
+// A reviewer's standing on one PR: asked again wins, then their latest approval or change request, then a comment.
+function teamState(pr: TeamPr, login: string): TeamState | null {
+  if (pr.requested.some(one => one.login === login)) {
+    return 'requested'
+  }
+  const theirs = pr.reviews.filter(one => one.login === login).sort((a, b) => b.at.localeCompare(a.at))
+  const decided = theirs.find(one => one.state === 'APPROVED' || one.state === 'CHANGES_REQUESTED')
+  if (decided) {
+    return decided.state === 'APPROVED' ? 'approved' : 'changes'
+  }
+
+  return theirs.some(one => one.state === 'COMMENTED') ? 'commented' : null
+}
+
+// `me` goes first so the reader finds their own row and column at once.
+export function teamOf(prs: TeamPr[], me: string): Team {
+  const team: Team = { people: [], cells: {}, waiting: [], open: {}, unreviewed: [], drafts: 0 }
+  const people = new Set<string>()
+  for (const pr of prs) {
+    if (pr.isDraft) {
+      team.drafts++
+      continue
+    }
+    people.add(pr.author)
+    team.open[pr.author] = (team.open[pr.author] ?? 0) + 1
+    const reviewers = new Set([...pr.requested.map(one => one.login), ...pr.reviews.map(one => one.login)])
+    reviewers.delete(pr.author)
+    if (reviewers.size === 0) {
+      team.unreviewed.push(pr)
+    }
+    for (const reviewer of reviewers) {
+      const state = teamState(pr, reviewer)
+      if (!state) {
+        continue
+      }
+      people.add(reviewer)
+      const row = (team.cells[reviewer] ??= {})
+      const cell = row[pr.author]
+      row[pr.author] = {
+        state: cell && TEAM_URGENCY.indexOf(cell.state) < TEAM_URGENCY.indexOf(state) ? cell.state : state,
+        count: (cell?.count ?? 0) + 1,
+      }
+      const request = pr.requested.find(one => one.login === reviewer)
+      if (request) {
+        team.waiting.push({ reviewer, pr, since: request.at })
+      }
+    }
+  }
+  team.people = [...people].sort((a, b) => Number(b === me) - Number(a === me) || a.localeCompare(b))
+  team.waiting.sort((a, b) => a.since.localeCompare(b.since))
+
+  return team
+}
+
+const TEAM_SYMBOLS: Record<TeamState, Chip> = {
+  requested: { text: '◆', color: 'warning' },
+  changes: { text: '✗', color: 'error' },
+  commented: { text: '○' },
+  approved: { text: '✓', color: 'success' },
+}
+
+// The team view as colored lines: the reviewer × author matrix, then the longest-waiting requests and a legend.
+export function teamLines(team: Team, me: string, now: number): Chip[][] {
+  if (team.people.length === 0) {
+    return [[{ text: 'No open PRs.', dim: true }]]
+  }
+  const name = (login: string) => (login === me ? 'you' : login)
+  const cellWidth = 6
+  const labelWidth = Math.min(16, Math.max(13, ...team.people.map(one => name(one).length + 2)))
+  const label = (text: string, chip: Partial<Chip> = {}): Chip => ({ ...chip, text: (text.length >= labelWidth ? `${text.slice(0, labelWidth - 2)}…` : text).padEnd(labelWidth) })
+  const cell = (text: string, chip: Partial<Chip> = {}): Chip => ({ ...chip, text: text.slice(0, cellWidth - 1).padEnd(cellWidth) })
+  const isOverdue = (since: string) => now - Date.parse(since) > TEAM_OVERDUE_MS
+  // Numbers repeat across repos, so they carry the repo's name when there are several.
+  const isMultiRepo = new Set([...team.waiting.map(one => one.pr.repo), ...team.unreviewed.map(pr => pr.repo)]).size > 1
+  const ref = (pr: TeamPr) => `${isMultiRepo ? (pr.repo.split('/')[1] ?? pr.repo) : ''}#${pr.number}`
+  const lines: Chip[][] = [
+    [label('reviewer ↓', { dim: true }), { text: 'author →', dim: true }],
+    [label(''), ...team.people.map(one => cell(name(one), { dim: true })), { text: '│ waiting', dim: true }],
+  ]
+  for (const reviewer of team.people) {
+    const row = team.cells[reviewer] ?? {}
+    const waits = team.waiting.filter(one => one.reviewer === reviewer)
+    const oldest = waits[0]
+    const load: Chip[] = oldest
+      ? [
+          { text: `│ ${waits.length} `, dim: true },
+          { text: `oldest ${age(oldest.since, now)}${isOverdue(oldest.since) ? ' ⚠' : ''}`, ...(isOverdue(oldest.since) ? { color: 'error' } : { dim: true }) },
+        ]
+      : [{ text: '│ 0', dim: true }]
+    lines.push([
+      label(name(reviewer)),
+      ...team.people.map(author => {
+        const one = row[author]
+        if (author === reviewer) {
+          return cell('')
+        }
+
+        return one ? cell(`${TEAM_SYMBOLS[one.state].text}${one.count}`, TEAM_SYMBOLS[one.state]) : cell('·', { dim: true })
+      }),
+      ...load,
+    ])
+  }
+  const rule = '─'.repeat(labelWidth + cellWidth * team.people.length)
+  lines.push([{ text: `${rule}┼`, dim: true }])
+  lines.push([label('open PRs', { dim: true }), ...team.people.map(one => cell(String(team.open[one] ?? '·'), { dim: !team.open[one] })), { text: '│', dim: true }])
+  if (team.unreviewed.length > 0) {
+    const unreviewed = (author: string) => team.unreviewed.filter(pr => pr.author === author).length
+    lines.push([
+      label('no reviewer', { color: 'warning' }),
+      ...team.people.map(one => (unreviewed(one) ? cell(String(unreviewed(one)), { color: 'warning' }) : cell('·', { dim: true }))),
+      { text: '│', dim: true },
+    ])
+  }
+  if (team.waiting.length > 0) {
+    lines.push([{ text: '' }], [{ text: 'Waiting longest', dim: true }])
+    for (const wait of team.waiting.slice(0, 8)) {
+      const overdue = isOverdue(wait.since)
+      lines.push([
+        { text: `${age(wait.since, now).padStart(4)}  `, ...(overdue ? { color: 'error' } : { dim: true }) },
+        { text: `◆ ${name(wait.reviewer)}`, color: 'warning' },
+        { text: ` → ${ref(wait.pr)} ${wait.pr.title}` },
+        { text: ` by ${name(wait.pr.author)}`, dim: true },
+      ])
+    }
+  }
+  if (team.unreviewed.length > 0) {
+    lines.push([{ text: '' }], [{ text: 'No reviewer yet', dim: true }])
+    for (const pr of team.unreviewed) {
+      lines.push([{ text: `${age(pr.createdAt, now).padStart(4)}  `, dim: true }, { text: `${ref(pr)} ${pr.title}` }, { text: ` by ${name(pr.author)}`, dim: true }])
+    }
+  }
+  lines.push(
+    [{ text: '' }],
+    [
+      { text: '◆ asked, waiting', color: 'warning' },
+      { text: '  ' },
+      { text: '✗ changes requested', color: 'error' },
+      { text: '  ○ commented  ' },
+      { text: '✓ approved', color: 'success' },
+      { text: '  · none · ⚠ waiting over 2 days', dim: true },
+    ],
+    [{ text: 'A cell counts the PRs and shows the most urgent state among them.', dim: true }],
+  )
+
+  return lines
 }

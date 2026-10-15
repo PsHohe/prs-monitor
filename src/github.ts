@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path'
 
 import type { PrRow } from './types'
 import { isRateLimited, parseCache } from './lib/lib'
-import type { ChangesData, Conversation, GqlPr, MergedPr, PrThreads, SharedCache, Snooze, ThreadDetail, ThreadSummary } from './lib/lib'
+import type { ChangesData, Conversation, GqlPr, MergedPr, PrThreads, SharedCache, Snooze, TeamPr, ThreadDetail, ThreadSummary } from './lib/lib'
 
 export type RunResult = { exitCode: number; stdout: string; stderr: string }
 
@@ -461,4 +461,70 @@ export async function resolveThread(threadId: string): Promise<Done> {
   const query = 'mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { isResolved } } }'
 
   return done(await gh(['api', 'graphql', '-f', `query=${query}`, '-f', `id=${threadId}`]), 'Thread resolved')
+}
+
+// Every open PR in the given repos, with who is asked to review it and since when, for the team view: about 3 points.
+const TEAM_QUERY = `query($q: String!) {
+  search(query: $q, type: ISSUE, first: 100) { nodes { ... on PullRequest {
+    number title isDraft createdAt author { __typename login } repository { nameWithOwner }
+    reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on User { login } ... on Team { slug } } } }
+    timelineItems(itemTypes: [REVIEW_REQUESTED_EVENT], last: 20) { nodes { ... on ReviewRequestedEvent {
+      createdAt requestedReviewer { ... on User { login } ... on Team { slug } }
+    } } }
+    reviews(last: 50) { nodes { author { __typename login } state submittedAt } }
+  } } }
+}`
+
+type TeamNode = {
+  number?: number
+  title: string
+  isDraft: boolean
+  createdAt: string
+  author: { __typename: string; login: string } | null
+  repository: { nameWithOwner: string }
+  reviewRequests: { nodes: { requestedReviewer: { __typename: string; login?: string; slug?: string } | null }[] }
+  timelineItems: { nodes: { createdAt?: string; requestedReviewer?: { login?: string; slug?: string } | null }[] }
+  reviews: { nodes: { author: { __typename: string; login: string } | null; state: string; submittedAt: string }[] }
+}
+
+export async function fetchTeam(repos: string[]): Promise<TeamPr[] | { failure: string }> {
+  if (repos.length === 0) {
+    return { failure: 'No repository to look at' }
+  }
+  const query = `is:pr is:open ${repos.map(one => `repo:${one}`).join(' ')}`
+  const result = await gh(['api', 'graphql', '-f', `query=${TEAM_QUERY}`, '-f', `q=${query}`])
+  if (result.exitCode !== 0) {
+    return { failure: result.stderr.trim() || 'gh api graphql failed' }
+  }
+  const nodes = (JSON.parse(result.stdout) as { data: { search: { nodes: TeamNode[] } } }).data.search.nodes
+  // Bots neither review nor need reviewers chased; teams show as @slug.
+  const who = (one: { __typename?: string; login?: string; slug?: string } | null | undefined) =>
+    !one || one.__typename === 'Bot' ? null : one.slug ? `@${one.slug}` : (one.login ?? null)
+
+  return nodes
+    .filter(node => typeof node.number === 'number' && who(node.author))
+    .map(node => {
+      const asked = node.timelineItems.nodes
+      const requested = node.reviewRequests.nodes.flatMap(({ requestedReviewer }) => {
+        const login = who(requestedReviewer)
+        const event = asked.filter(one => who(one.requestedReviewer) === login).at(-1)
+
+        return login ? [{ login, at: event?.createdAt ?? node.createdAt }] : []
+      })
+
+      return {
+        repo: node.repository.nameWithOwner,
+        number: node.number as number,
+        title: node.title,
+        author: who(node.author) as string,
+        isDraft: node.isDraft,
+        createdAt: node.createdAt,
+        requested,
+        reviews: node.reviews.nodes.flatMap(review => {
+          const login = who(review.author)
+
+          return login ? [{ login, state: review.state, at: review.submittedAt }] : []
+        }),
+      }
+    })
 }

@@ -6,12 +6,13 @@ import { render } from 'ink'
 import type { PrRow } from './types'
 import { digest, quickReport } from './ai'
 import type { ReportResult } from './ai'
-import { readState, updateState } from './github'
-import { age, ago, alertOf, ciChip, extraChips, reviewChip, staleness, threadsChip } from './lib/lib'
+import { fetchTeam, readState, updateState } from './github'
+import { age, ago, alertOf, ciChip, extraChips, reviewChip, staleness, teamLines, teamOf, threadsChip } from './lib/lib'
 import type { Chip } from './lib/lib'
 import { configFor, detectScope, loadConfigs, refresh } from './monitor'
 import type { Snapshot } from './monitor'
 import { App } from './ui/App'
+import { mouseStdin } from './ui/mouse'
 
 const USAGE = `Usage: prs [command] [options]
 
@@ -21,6 +22,7 @@ Commands:
   status    One-line summary for a status line; reads only the cache unless --fetch
   report N  AI status report of PR N (or owner/name#N), streamed as it is written
   digest    AI summary of what to do first across your PRs (with --all, every repo)
+  team      Who reviews whom across the repo's open PRs (with --all, every repo you have PRs in)
 
 Options:
   --all     Every repo involving you, not only the current one
@@ -44,7 +46,7 @@ const isColored = values.color || !!process.stdout.isTTY
 const ANSI: Record<NonNullable<Chip['color']>, number> = { error: 31, warning: 33, success: 32, merged: 35 }
 
 const command = positionals[0] ?? (process.stdout.isTTY && process.stdin.isTTY ? 'view' : 'list')
-if (values.help || !['view', 'list', 'status', 'report', 'digest'].includes(command)) {
+if (values.help || !['view', 'list', 'status', 'report', 'digest', 'team'].includes(command)) {
   console.log(USAGE)
   process.exit(values.help ? 0 : 1)
 }
@@ -68,6 +70,7 @@ const memory = { seen: state.seen, snoozed: state.snoozed }
 if (command === 'view') {
   const app = render(<App initialScope={scope} initialConfigs={configs} initialState={state} />, {
     alternateScreen: true,
+    stdin: process.stdin.isTTY ? mouseStdin() : process.stdin,
   })
   await app.waitUntilExit()
   process.exit(0)
@@ -86,6 +89,29 @@ if (command === 'digest') {
   const { rows, current } = snapshot
   const all = current && !rows.some(pr => pr.number === current.number && pr.repo === current.repo) ? [...rows, current] : rows
   await stream(digest(all.filter(pr => pr.state === 'OPEN'), snapshot.me, configs.current, { onText: write }))
+}
+
+if (command === 'team') {
+  const repos = scope.isAll ? [...new Set(snapshot.rows.map(pr => pr.repo).filter(Boolean))] : scope.repo ? [scope.repo] : []
+  if (repos.length === 0) {
+    console.error(scope.isAll ? snapshot.error ?? 'No PRs loaded' : 'Not inside a GitHub repository; pass --all')
+    process.exit(1)
+  }
+  const prs = await fetchTeam(repos)
+  if ('failure' in prs) {
+    console.error(prs.failure)
+    process.exit(1)
+  }
+  if (values.json) {
+    console.log(JSON.stringify(prs, null, 2))
+    process.exit(0)
+  }
+  const team = teamOf(prs, snapshot.me ?? '')
+  console.log(`Open PRs in ${repos.length === 1 ? repos[0] : `${repos.length} repos`}${team.drafts ? ` · ${team.drafts} draft${team.drafts === 1 ? '' : 's'} not shown` : ''}\n`)
+  for (const line of teamLines(team, snapshot.me ?? '', Date.now())) {
+    console.log(line.map(paint).join('').trimEnd())
+  }
+  process.exit(0)
 }
 
 if (values.json) {

@@ -10,16 +10,20 @@ import {
   owedReplies,
   parseConfigFile,
   repliesPrompt,
+  reportModelLabel,
   rerequestable,
   rowKey,
+  setFrontmatter,
   staleness,
+  teamLines,
+  teamOf,
   threadsChip,
   threadMarkdown,
   threadPages,
   tomorrowMorning,
   toRow,
 } from '../src/lib/lib'
-import type { ChangesData, Conversation, RawPr, RowOptions, ThreadDetail, ThreadSummary } from '../src/lib/lib'
+import type { ChangesData, Conversation, RawPr, RowOptions, TeamPr, ThreadDetail, ThreadSummary } from '../src/lib/lib'
 
 const PLAIN: RowOptions = { automated: null, ticket: null, flakyChecks: [] }
 const NOW = Date.parse('2026-10-07T12:00:00Z')
@@ -52,6 +56,32 @@ test('merge_method is read from the config and defaults to a merge commit', () =
   expect(mergeConfig([]).mergeMethod).toBe('merge')
   expect(mergeConfig([parseConfigFile('---\nmerge_method: squash\n---\n')]).mergeMethod).toBe('squash')
   expect(mergeConfig([parseConfigFile('---\nmerge_method: fast\n---\n')]).mergeMethod).toBe('merge')
+})
+
+test('report_provider picks Claude or Codex, and each keeps its own model', () => {
+  expect(mergeConfig([]).reportProvider).toBe('claude')
+  const config = mergeConfig([
+    parseConfigFile('---\nreport_provider: codex\ncodex_model: gpt-6-sol\n---\n'),
+    parseConfigFile('---\nreport_model: opus\nreport_provider: gpt\n---\n'),
+  ])
+  expect(config.reportProvider).toBe('codex')
+  expect(config.reportModel).toBe('opus')
+  expect(reportModelLabel(config)).toBe('codex · gpt-6-sol')
+  expect(reportModelLabel({ ...config, codexModel: '' })).toBe('codex · default')
+  expect(reportModelLabel({ ...config, reportProvider: 'claude' })).toBe('opus')
+})
+
+test('setFrontmatter replaces, adds and removes keys and keeps the rest of the file', () => {
+  const file = '---\npoll_interval: 3m\nreport_model: sonnet   # for reports\nnote: a---b\n---\n## Opinion\nBe kind.\n'
+  expect(setFrontmatter(file, { report_model: 'opus', report_provider: 'codex' })).toBe(
+    '---\npoll_interval: 3m\nreport_model: opus\nnote: a---b\nreport_provider: codex\n---\n## Opinion\nBe kind.\n',
+  )
+  expect(setFrontmatter(file, { report_model: '', poll_interval: '' })).toBe('---\nnote: a---b\n---\n## Opinion\nBe kind.\n')
+  expect(setFrontmatter('## Opinion\nBe kind.\n', { codex_model: 'gpt-6-sol' })).toBe('---\ncodex_model: gpt-6-sol\n---\n## Opinion\nBe kind.\n')
+  expect(setFrontmatter('', { report_provider: 'codex' })).toBe('---\nreport_provider: codex\n---\n')
+  expect(setFrontmatter('---\n---\nBody\n', { codex_model: '' })).toBe('Body\n')
+  const written = setFrontmatter('', { report_provider: 'codex', codex_model: 'gpt-6-sol' })
+  expect(mergeConfig([parseConfigFile(written)])).toMatchObject({ reportProvider: 'codex', codexModel: 'gpt-6-sol' })
 })
 
 test('reviewers keep each person latest review, without me, and re-request skips approvals', () => {
@@ -307,4 +337,47 @@ test('a thread page says why it waits, shows the code and every comment', () => 
   const theirs = threadMarkdown({ thread: detail({ comments: [{ author: 'bob', body: 'Hm', at: '2026-10-07T10:00:00Z' }] }), isOwed: true }, 'me', 0)
   expect(theirs).toContain('↩ Waiting on you: bob commented on your PR')
   expect(threadMarkdown({ thread: detail({}), isOwed: false }, 'me', 0)).toContain('Not waiting on you · last from ana')
+})
+
+function teamPr(over: Partial<TeamPr>): TeamPr {
+  return { repo: 'o/r', number: 1, title: 'T', author: 'ana', isDraft: false, createdAt: '2026-10-01T00:00:00Z', requested: [], reviews: [], ...over }
+}
+
+test('team: a cell counts PRs per reviewer and author and keeps the most urgent state', () => {
+  const team = teamOf(
+    [
+      teamPr({ number: 1, reviews: [{ login: 'bo', state: 'APPROVED', at: '2026-10-02T00:00:00Z' }] }),
+      teamPr({ number: 2, requested: [{ login: 'bo', at: '2026-10-03T00:00:00Z' }] }),
+      // A comment after an approval keeps the approval; the author's own replies are not reviews.
+      teamPr({
+        number: 3,
+        author: 'bo',
+        reviews: [
+          { login: 'me', state: 'APPROVED', at: '2026-10-02T00:00:00Z' },
+          { login: 'me', state: 'COMMENTED', at: '2026-10-04T00:00:00Z' },
+          { login: 'bo', state: 'COMMENTED', at: '2026-10-05T00:00:00Z' },
+        ],
+      }),
+      teamPr({ number: 4, author: 'cy' }),
+      teamPr({ number: 5, author: 'cy', isDraft: true, requested: [{ login: 'bo', at: '2026-10-01T00:00:00Z' }] }),
+    ],
+    'me',
+  )
+  expect(team.people).toEqual(['me', 'ana', 'bo', 'cy'])
+  expect(team.cells.bo?.ana).toEqual({ state: 'requested', count: 2 })
+  expect(team.cells.me?.bo).toEqual({ state: 'approved', count: 1 })
+  expect(team.cells.bo?.bo).toBeUndefined()
+  expect(team.waiting.map(one => [one.reviewer, one.pr.number])).toEqual([['bo', 2]])
+  expect(team.unreviewed.map(pr => pr.number)).toEqual([4])
+  expect(team.open).toEqual({ ana: 2, bo: 1, cy: 1 })
+  expect(team.drafts).toBe(1)
+})
+
+test('team: requests older than two days are flagged, and the reader shows as you', () => {
+  const team = teamOf([teamPr({ author: 'me', requested: [{ login: 'bo', at: '2026-10-04T12:00:00Z' }] })], 'me')
+  const text = teamLines(team, 'me', NOW).map(line => line.map(one => one.text).join(''))
+  expect(text[1]).toStartWith(' '.repeat(13))
+  expect(text[1]).toContain('you')
+  expect(text.find(line => line.startsWith('bo'))).toContain('oldest 3d ⚠')
+  expect(text.some(line => line.includes('◆ bo → #1 T by you'))).toBe(true)
 })

@@ -3,7 +3,18 @@ import { join } from 'node:path'
 
 import type { PrBucket, PrRow } from './types'
 import { cachePath, fetchPrs, fetchThreadSummaries, gh, readCache, run, writeCache } from './github'
-import { applySnoozes, compileRegex, fromGraphql, linkRows, mergeConfig, parseConfigFile, pauseAfter, RATE_BACKOFF_MS, toRow } from './lib/lib'
+import {
+  applySnoozes,
+  compileRegex,
+  fromGraphql,
+  linkRows,
+  mergeConfig,
+  parseConfigFile,
+  pauseAfter,
+  RATE_BACKOFF_MS,
+  setFrontmatter,
+  toRow,
+} from './lib/lib'
 import type { Config, GqlPr, PrThreads, RowOptions, SharedCache, Snooze } from './lib/lib'
 
 export type Scope = {
@@ -36,9 +47,11 @@ export async function detectScope(isAll: boolean, known: Record<string, string>)
   }
 }
 
+export const HOME_CONFIG = join(homedir(), '.claude', 'pr-monitor.md')
+
 export async function loadConfig(root: string | null): Promise<Config> {
   const paths = [
-    join(homedir(), '.claude', 'pr-monitor.md'),
+    HOME_CONFIG,
     ...(root ? [join(root, '.claude', 'pr-monitor.md'), join(root, '.claude', 'pr-monitor.local.md')] : []),
   ]
   const files = []
@@ -51,6 +64,13 @@ export async function loadConfig(root: string | null): Promise<Config> {
   }
 
   return mergeConfig(files)
+}
+
+// Writes frontmatter keys into the home file (made if missing), keeping everything else in it.
+export async function saveHomeSettings(values: Record<string, string>): Promise<void> {
+  const file = Bun.file(HOME_CONFIG)
+  const text = (await file.exists()) ? await file.text() : ''
+  await Bun.write(HOME_CONFIG, setFrontmatter(text, values))
 }
 
 // The settings that apply to each repo's PRs: the home file plus the repo's own files when we know

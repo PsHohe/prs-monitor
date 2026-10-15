@@ -2,7 +2,7 @@
 
 A terminal monitor for the GitHub pull requests that involve you. It is the standalone version of the `pr-monitor` Claude Code plugin: same buckets, chips, prompts and AI report, with one poller instead of one per Claude session.
 
-Needs [`gh`](https://cli.github.com) (logged in) and, for reports, [Claude Code](https://claude.com/claude-code) (logged in).
+Needs [`gh`](https://cli.github.com) (logged in) and, for reports, [Claude Code](https://claude.com/claude-code) or [Codex](https://github.com/openai/codex) (logged in).
 
 ## Use
 
@@ -13,9 +13,10 @@ prs list [--all]    # print once
 prs status          # one line for a status line; reads only the cache
 prs report 425      # AI status report (or owner/name#425 from anywhere)
 prs digest [--all]  # AI summary of what to do first
+prs team [--all]    # who reviews whom across the open PRs
 ```
 
-In the view: `↑↓`/`jk` move, `⏎` folds a group (on a PR, opens it), `/` filters by number, title, author or repo (`esc` clears it), `A` switches between this repo and all repos, `D` opens the digest, `u` refreshes, `?` lists every key and symbol, `q` quits. On a PR (the area above the footer shows its details and the keys that apply, grouped as copy │ view │ change │ mark, with the keys that change GitHub or git in yellow):
+In the view: `↑↓`/`jk` move, `⏎` folds a group (on a PR, opens it), `/` filters by number, title, author or repo (`esc` clears it), `A` switches between this repo and all repos, `D` opens the digest, `T` the team view, `u` refreshes, `S` opens the settings (the AI provider and model, saved to `~/.claude/pr-monitor.md`), `?` lists every key and symbol, `q` quits. The mouse works too: the wheel moves the selection (or scrolls a panel), a click picks a PR and a second click opens it, and a click on a group folds it; hold ⌥ (or shift) to select text. On a PR (the area above the footer shows its details and the keys that apply, grouped as copy │ view │ change │ mark, with the keys that change GitHub or git in yellow):
 
 | Key | Does |
 | --- | --- |
@@ -36,11 +37,15 @@ In the view: `↑↓`/`jk` move, `⏎` folds a group (on a PR, opens it), `/` fi
 
 Panels (report, changes, digest) scroll with `↑↓`, `space`/`b` page, `g`/`G` jump to the top or bottom; `c` copies, `x` redoes, `esc` goes back.
 
+## Team view
+
+`T` in the view, or `prs team`, shows every open PR in the repo (with `--all`, in each repo you have PRs in), not only yours, as a matrix: a row per reviewer, a column per author, and in each cell how many of that author's PRs the reviewer is on, marked with the most urgent state (`◆` asked and waiting, `✗` changes requested, `○` commented, `✓` approved). The last column counts the requests waiting on each reviewer and how old the oldest is, red with `⚠` after two days. Below it come the longest-waiting requests and the PRs nobody has been asked to review. Drafts and bots are left out. It is one query of about 3 points, made when you open it (`x` asks again).
+
 Prompts go to the clipboard: paste them into whichever Claude session you want. In "waiting on me" the age turns yellow after a day and red after three.
 
 A review thread waits for your reply (`↩`, and the PR moves to "waiting on me") when it is unresolved and someone else wrote last: any thread on your PR, or one you started on someone else's. Your own comments matching `automated_comments` don't count as replies.
 
-While open, the view checks every minute whether the poll interval passed or the branch changed, and sends a macOS notification on new activity or when a PR becomes ready to merge.
+While open, the view checks every minute whether the poll interval passed or the branch changed, and sends a terminal notification (OSC 9: iTerm2, Ghostty, WezTerm, kitty; `herdr notification show` inside herdr) on new activity or when a PR becomes ready to merge. Clicking it focuses the terminal.
 
 ## Status line
 
@@ -57,7 +62,9 @@ The plugin's files, merged in this order: `~/.claude/pr-monitor.md`, then the re
 ```markdown
 ---
 poll_interval: 3m
-report_model: sonnet
+report_provider: claude                     # claude | codex, for reports and the digest
+report_model: sonnet                        # Claude's model
+codex_model: gpt-6.1-sol                    # Codex's model; leave out for Codex's default
 automated_comments: "^(🚀|Tests failed)"   # comments under your account that are not you
 ticket_pattern: "PD-\d+"                    # links hotfix twins by ticket
 twin_bases: prod, develop
@@ -93,5 +100,5 @@ A refresh is one GraphQL query of about 2–4 points. PRs with unresolved thread
 bun install
 bun test
 bun run typecheck
-bun run build       # single binary at dist/prs; reports use the claude on your PATH
+bun run build       # single binary at dist/prs; reports use the claude or codex on your PATH
 ```

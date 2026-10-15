@@ -72,8 +72,14 @@ export function openUrl(url: string): void {
   void run(['open', url])
 }
 
+// The terminal posts the notification, so clicking it focuses the terminal. herdr stops
+// OSC sequences at its panes, so inside it we go through its own notification command.
 export function notify(text: string): void {
-  const quoted = (value: string) => `"${value.replace(/["\\]/g, '\\$&')}"`
-  void run(['osascript', '-e', `display notification ${quoted(text)} with title "PRs"`])
+  const clean = text.replace(/[\x00-\x1f\x7f]/g, ' ')
+  if (process.env.HERDR_ENV) {
+    void run([process.env.HERDR_BIN_PATH ?? 'herdr', 'notification', 'show', 'PRs', '--body', clean])
+  } else {
+    process.stdout.write(`\x1b]9;PRs: ${clean}\x07`)
+  }
   process.stdout.write('\x07')
 }

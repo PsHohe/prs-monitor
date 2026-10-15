@@ -1,3 +1,5 @@
+import { homedir } from 'node:os'
+
 import { Box, Text, useApp, useInput, useWindowSize } from 'ink'
 import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
@@ -5,12 +7,13 @@ import type { ReactNode } from 'react'
 import type { PrBucket, PrRow } from '../types'
 import { copy, localOffset, notify, openUrl, promptFor, reviewLabel } from '../actions'
 import type { Action } from '../actions'
-import { digest, quickReport } from '../ai'
+import { codexModels, digest, quickReport } from '../ai'
 import type { ReportResult } from '../ai'
 import {
   checkoutPr,
   fetchChanges,
   fetchConversation,
+  fetchTeam,
   fetchThreads,
   mergePr,
   readState,
@@ -32,19 +35,24 @@ import {
   ciChip,
   detailOf,
   extraChips,
+  REPORT_PROVIDERS,
+  reportModelLabel,
   rerequestable,
   reviewChip,
   rowKey,
   staleness,
+  teamLines,
+  teamOf,
   threadMarkdown,
   threadPages,
   threadsChip,
   tomorrowMorning,
 } from '../lib/lib'
-import type { Chip, ThreadDetail } from '../lib/lib'
-import { configFor, loadConfigs, refresh, sortRows } from '../monitor'
+import type { Chip, Config, ThreadDetail } from '../lib/lib'
+import { configFor, HOME_CONFIG, loadConfigs, refresh, saveHomeSettings, sortRows } from '../monitor'
 import type { Configs, RefreshOptions, Scope, Snapshot } from '../monitor'
 import { markdownLines } from './markdown'
+import { useMouse } from './mouse'
 import { Panel } from './Panel'
 
 const TICK_MS = 60 * 1000
@@ -56,15 +64,19 @@ const BUCKETS: { bucket: PrBucket; title: string; color?: string }[] = [
   { bucket: 'snoozed', title: 'SNOOZED' },
 ]
 const COLORS: Record<NonNullable<Chip['color']>, string> = { error: 'red', warning: 'yellow', success: 'green', merged: 'magenta' }
+const CLAUDE_MODELS = ['sonnet', 'opus', 'haiku', 'fable']
+const HOME_CONFIG_SHOWN = HOME_CONFIG.replace(homedir(), '~')
+const PROVIDER_NAMES = { claude: 'Claude', codex: 'Codex' } as const
 const MERGE_WORDS = { merge: 'a merge commit', squash: 'squash', rebase: 'rebase' } as const
 // What a PR key does, in the order the actions line shows them; `change` keys touch GitHub or git.
 type KeyGroup = 'copy' | 'view' | 'change' | 'mark'
 const KEY_GROUPS: KeyGroup[] = ['copy', 'view', 'change', 'mark']
 const HELP = `## List
-\`↑↓\` \`jk\` move · \`⏎\` fold a group or view a PR · \`/\` filter · \`A\` this repo / all repos · \`D\` digest · \`u\` refresh · \`?\` this help · \`q\` quit
+\`↑↓\` \`jk\` move · \`⏎\` fold a group or view a PR · \`/\` filter · \`A\` this repo / all repos · \`D\` digest · \`T\` team · \`u\` refresh · \`S\` settings · \`?\` this help · \`q\` quit
+The mouse wheel moves, a click picks a PR and a second click views it, a click on a group folds it. Hold ⌥ (or shift) to select text.
 
 ## On a PR
-**Copy a prompt for Claude** (cyan)
+**Copy a prompt for Claude or Codex** (cyan)
 \`v\` Review / Re-review · \`a\` Ask · \`c\` Clean a merged PR
 
 **View** (cyan)
@@ -77,7 +89,7 @@ const HELP = `## List
 \`s\` seen · \`z\` snooze until new activity (again wakes it) · \`Z\` until 9:00 tomorrow or new activity
 
 ## Panels
-\`↑↓\` \`jk\` scroll · \`space\` \`b\` page down / up · \`g\` \`G\` top / bottom · \`c\` copy · \`x\` redo · \`esc\` back
+\`↑↓\` \`jk\` or the wheel scroll · \`space\` \`b\` page down / up · \`g\` \`G\` top / bottom · \`c\` copy · \`x\` redo · \`esc\` back
 In a PR \`a\` copies Ask; in a report \`a\` copies Ask with the report.
 In threads \`←→\` \`n\` \`p\` switch thread · \`r\` reply (⏎ posts, esc cancels) · \`s\` resolve (asks first) · \`o\` opens the thread · \`a\` copies a prompt drafting the replies.
 
@@ -89,16 +101,20 @@ In threads \`←→\` \`n\` \`p\` switch thread · \`r\` reply (⏎ posts, esc c
 \`✓ ready\` ready to merge · \`✗ conflicts\` · \`↓ behind\` its base
 \`Δ3\` commits since your review · \`Δ replies\` replies since your review
 \`◆ requested\` your review is requested · \`↳#12\` stacked on #12 · \`⇄#12\` hotfix twin
+In the team view (\`T\`) a row is a reviewer and a column an author: \`◆\` asked and waiting · \`✗\` changes requested · \`○\` commented · \`✓\` approved, with how many PRs.
 The last column is the time since someone else's last activity; in waiting on me it turns yellow after a day and red after three.`
 
 type Flash = { text: string; isError?: boolean; isSticky?: boolean }
 // One terminal line; `item` is the selectable item it belongs to.
 type Line = { key: string; item?: string; node: ReactNode }
 type Item = { key: string; pr?: PrRow; bucket?: PrBucket }
-// A full-screen text view over the list: a PR with its discussion, its report, what changed since my review, its threads (a page each), the digest or the help.
-type PanelKind = 'pr' | 'report' | 'changes' | 'digest' | 'threads' | 'help'
+// A full-screen text view over the list: a PR with its discussion, its report, what changed since my review, its threads (a page each), the digest, the team or the help.
+type PanelKind = 'pr' | 'report' | 'changes' | 'digest' | 'team' | 'threads' | 'help'
 type ThreadPage = { thread: ThreadDetail; isOwed: boolean; text: string }
-type PanelState = { kind: PanelKind; pr: PrRow | null; status: 'loading' | 'done' | 'error'; text: string; at: number; pages?: ThreadPage[] }
+// `lines` are colored lines shown instead of the text as markdown (the team view).
+type PanelState = { kind: PanelKind; pr: PrRow | null; status: 'loading' | 'done' | 'error'; text: string; at: number; pages?: ThreadPage[]; lines?: Chip[][] }
+// The settings screen: the picked row, and the models the Codex CLI lists (loaded when it opens).
+type Settings = { row: number; codexModels: string[]; hasCodex: boolean }
 // A GitHub action waiting for y.
 type Confirm = { text: string; run: () => Promise<Done>; after?: () => Promise<unknown> }
 
@@ -125,6 +141,8 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
   // A reply being typed to a thread.
   const [draft, setDraft] = useState<{ thread: ThreadDetail; text: string } | null>(null)
   const [confirm, setConfirm] = useState<Confirm | null>(null)
+  const [settings, setSettings] = useState<Settings | null>(null)
+  const isSaving = useRef(false)
   const panelAbort = useRef<AbortController | null>(null)
   const scope = useRef(initialScope)
   const configs = useRef(initialConfigs)
@@ -137,6 +155,8 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
   const offset = useRef(0)
   // The selected item as of the last key, so keys typed faster than a render still move from the right place.
   const pickedKey = useRef<string | null>(null)
+  // Where the list's lines start on screen (0-based) and how many show, for mouse clicks.
+  const listArea = useRef({ first: 0, room: 0 })
 
   const pollMs = () => configs.current.current.pollMinutes * 60 * 1000
 
@@ -287,7 +307,8 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
       await markSeen(pr)
     }
     const name = { review: reviewLabel(pr), clean: 'Cleanup', ask: 'Ask', replies: 'Replies' }[action]
-    setFlash({ text: `${name} prompt for #${pr.number} copied · paste it into Claude` })
+    const provider = PROVIDER_NAMES[configFor(configs.current, pr.repo).reportProvider]
+    setFlash({ text: `${name} prompt for #${pr.number} copied · paste it into ${provider}` })
   }
 
   // Runs a GitHub action, says how it went and refreshes from GitHub when it worked.
@@ -333,6 +354,19 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
       const all = snapRef.current
       const rows = all ? [...all.rows, ...(all.current && !all.rows.some(one => rowKey(one) === rowKey(all.current!)) ? [all.current] : [])] : []
       result = await digest(rows.filter(one => one.state === 'OPEN'), all?.me ?? '', configs.current.current, streaming)
+    } else if (kind === 'team') {
+      const all = snapRef.current
+      const repos = isAll ? [...new Set((all?.rows ?? []).map(one => one.repo).filter(Boolean))] : scope.current.repo ? [scope.current.repo] : []
+      const prs = await fetchTeam(repos)
+      if ('failure' in prs) {
+        result = prs
+      } else {
+        const team = teamOf(prs, all?.me ?? '')
+        const lines = teamLines(team, all?.me ?? '', Date.now())
+        const where = repos.length === 1 ? repos[0] : `${repos.length} repos`
+        write({ lines })
+        result = { text: [`Open PRs in ${where}${team.drafts ? ` · ${team.drafts} draft${team.drafts === 1 ? '' : 's'} not shown` : ''}`, '', ...lines.map(line => line.map(one => one.text).join('').trimEnd())].join('\n') }
+      }
     } else if (!pr?.repo) {
       result = { failure: 'Unknown repository for this PR' }
     } else if (kind === 'threads') {
@@ -352,6 +386,58 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
       result = 'failure' in changes ? changes : { text: changesMarkdown(changes) }
     }
     write('failure' in result ? { status: 'error', text: result.failure } : { status: 'done', text: result.text, at: Date.now() })
+  }
+
+  // ---- Settings: the AI provider and model, saved to the home config file as they change.
+  const openSettings = async () => {
+    setSettings({ row: 0, codexModels: [], hasCodex: !!Bun.which('codex') })
+    const models = await codexModels()
+    setSettings(one => one && { ...one, codexModels: models })
+  }
+
+  // The models offered for the saved provider, keeping a model typed into the file by hand.
+  const modelChoices = (config: Config, codex: string[]) => {
+    const [choices, value] = config.reportProvider === 'codex' ? [['', ...codex], config.codexModel] : [CLAUDE_MODELS, config.reportModel]
+
+    return choices.includes(value) ? choices : [...choices, value]
+  }
+
+  const changeSetting = async (by: number) => {
+    if (!settings || isSaving.current) {
+      return
+    }
+    const home = configs.current.home
+    const turn = <T,>(choices: T[], value: T) => choices[(choices.indexOf(value) + by + choices.length) % choices.length] ?? value
+    let values: Record<string, string>
+    if (settings.row === 0) {
+      values = { report_provider: turn(REPORT_PROVIDERS, home.reportProvider) }
+    } else if (home.reportProvider === 'codex') {
+      values = { codex_model: turn(modelChoices(home, settings.codexModels), home.codexModel) }
+    } else {
+      values = { report_model: turn(modelChoices(home, settings.codexModels), home.reportModel) }
+    }
+    isSaving.current = true
+    try {
+      await saveHomeSettings(values)
+      configs.current = await loadConfigs(scope.current, (await readState()).repos)
+      setFlash({ text: `Saved to ${HOME_CONFIG_SHOWN}` })
+    } catch (err) {
+      setFlash({ text: `Could not save: ${err instanceof Error ? err.message : String(err)}`, isError: true })
+    } finally {
+      isSaving.current = false
+    }
+  }
+
+  const onSettingsKey = (input: string, key: Key) => {
+    if (input === 'q' || key.escape || input === 'S') {
+      setSettings(null)
+    } else if (key.downArrow || input === 'j' || key.upArrow || input === 'k') {
+      setSettings(one => one && { ...one, row: 1 - one.row })
+    } else if (key.rightArrow || input === 'l' || input === ' ' || key.return) {
+      void changeSetting(1)
+    } else if (key.leftArrow || input === 'h') {
+      void changeSetting(-1)
+    }
   }
 
   const toggleBucket = async (bucket: PrBucket) => {
@@ -600,7 +686,19 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
   const pageAt = Math.max(0, Math.min(panelPage, pages.length - 1))
   const page = pages[pageAt]
   const panelText = page?.text ?? panel?.text ?? ''
-  const panelLines = panel ? markdownLines(panelText || ' ', columns - 2) : []
+  const panelLines = panel?.lines
+    ? panel.lines.map(line => (
+        <Text wrap="truncate-end">
+          {line.map((one, index) => (
+            <Text key={index} color={one.color ? COLORS[one.color] : undefined} dimColor={one.dim}>
+              {one.text}
+            </Text>
+          ))}
+        </Text>
+      ))
+    : panel
+      ? markdownLines(panelText || ' ', columns - 2)
+      : []
   const panelRoom = Math.max(3, height - 5)
   const panelMax = Math.max(0, panelLines.length - panelRoom)
 
@@ -614,6 +712,7 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     pageUp: boolean
     home: boolean
     end: boolean
+    return: boolean
   }
 
   const onPanelKey = (input: string, key: Key) => {
@@ -711,6 +810,15 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     }
   }
 
+  const pick = (key: string | null) => {
+    pickedKey.current = key
+    setSelected(key)
+  }
+  const step = (by: number) => {
+    const index = items.findIndex(item => item.key === pickedKey.current)
+    pick(items[Math.max(0, Math.min(items.length - 1, index + by))]?.key ?? null)
+  }
+
   useInput((input, key) => {
     if (key.ctrl && input === 'c') {
       exit()
@@ -732,21 +840,21 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
 
       return
     }
+    if (settings) {
+      onSettingsKey(input, key)
+
+      return
+    }
     if (isPanelOpen) {
       onPanelKey(input, key)
 
       return
     }
-    const index = items.findIndex(item => item.key === pickedKey.current)
-    const at = items[index] ?? picked
-    const move = (to: number) => {
-      pickedKey.current = items[to]?.key ?? null
-      setSelected(pickedKey.current)
-    }
+    const at = items.find(item => item.key === pickedKey.current) ?? picked
     if (key.downArrow || (!isFiltering && input === 'j')) {
-      move(Math.min(items.length - 1, index + 1))
+      step(1)
     } else if (key.upArrow || (!isFiltering && input === 'k')) {
-      move(Math.max(0, index - 1))
+      step(-1)
     } else if (isFiltering) {
       onFilterKey(input, key)
     } else if (input === 'q') {
@@ -764,10 +872,45 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
       void load({ maxAgeMs: 0, canFetch: true }, { force: true })
     } else if (input === 'D') {
       void openPanel('digest', null)
+    } else if (input === 'T') {
+      void openPanel('team', null)
+    } else if (input === 'S') {
+      void openSettings()
     } else if (at?.bucket && (key.return || input === ' ')) {
       void toggleBucket(at.bucket)
     } else if (at?.pr) {
       onPrKey(key.return ? '⏎' : input, at.pr)
+    }
+  })
+
+  // The wheel moves the selection or scrolls the panel; a click picks an item, and a second click acts like ⏎ (a group folds at once).
+  useMouse(({ kind, y }) => {
+    if (confirm || draft || settings) {
+      return
+    }
+    const by = kind === 'wheelDown' ? 1 : kind === 'wheelUp' ? -1 : 0
+    if (isPanelOpen) {
+      setPanelTop(top => Math.max(0, Math.min(panelMax, top + by * 3)))
+
+      return
+    }
+    if (by) {
+      step(by)
+
+      return
+    }
+    const row = y - 1 - listArea.current.first
+    const key = row >= 0 && row < listArea.current.room ? lines[offset.current + row]?.item : undefined
+    const item = items.find(one => one.key === key)
+    if (!item) {
+      return
+    }
+    const isPicked = item.key === pickedKey.current
+    pick(item.key)
+    if (item.bucket) {
+      void toggleBucket(item.bucket)
+    } else if (item.pr && isPicked) {
+      onPrKey('⏎', item.pr)
     }
   })
 
@@ -792,13 +935,74 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     </Box>
   )
 
+  if (settings) {
+    const { home, current } = configs.current
+    const choice = (value: string, isPicked: boolean, isRowPicked: boolean) => (
+      <Text key={value} color={isPicked ? 'cyan' : undefined} inverse={isPicked && isRowPicked} dimColor={!isPicked}>
+        {` ${value || 'default'} `}
+      </Text>
+    )
+    const isCodex = home.reportProvider === 'codex'
+    const model = isCodex ? home.codexModel : home.reportModel
+    const rows = [
+      { name: 'Provider', choices: REPORT_PROVIDERS as string[], value: home.reportProvider },
+      { name: 'Model', choices: modelChoices(home, settings.codexModels), value: model },
+    ]
+    // A repo's own files win over the home file, so say when they change what applies here.
+    const overrides = [
+      current.reportProvider !== home.reportProvider ? `provider ${current.reportProvider}` : null,
+      reportModelLabel(current) !== reportModelLabel(home) && current.reportProvider === home.reportProvider ? `model ${reportModelLabel(current)}` : null,
+    ].filter(Boolean)
+    const body: ReactNode[] = [
+      <Text bold>AI for reports and the digest</Text>,
+      <Text> </Text>,
+      ...rows.map(({ name, choices, value }, index) => (
+        <Text wrap="wrap">
+          <Text bold={index === settings.row}>{index === settings.row ? '▸ ' : '  '}</Text>
+          <Text bold={index === settings.row}>{name.padEnd(10)}</Text>
+          {choices.map(one => choice(one, one === value, index === settings.row))}
+        </Text>
+      )),
+      <Text> </Text>,
+      <Text dimColor wrap="wrap">
+        {isCodex
+          ? 'Codex runs the codex CLI with its own login (codex login); default is the model Codex picks.'
+          : 'Claude runs the claude CLI with its own login.'}
+      </Text>,
+      ...(isCodex && !settings.hasCodex ? [<Text color="yellow">The codex CLI is not on your PATH.</Text>] : []),
+      ...(overrides.length > 0
+        ? [<Text color="yellow" wrap="wrap">{`This repo's .claude/pr-monitor files set ${overrides.join(' and ')}, which wins here.`}</Text>]
+        : []),
+    ].map((node, index) => <Box key={index}>{node}</Box>)
+
+    return (
+      <Panel
+        height={height}
+        title="Settings"
+        meta=""
+        subtitle={`saved to ${HOME_CONFIG_SHOWN}`}
+        body={body}
+        top={0}
+        room={Math.max(3, height - 5)}
+        footer={footer('↑↓ setting · ←→ change · esc back')}
+      />
+    )
+  }
+
   if (isPanelOpen && panel) {
     const { kind, pr, status } = panel
     const isHelp = kind === 'help'
-    const model = kind === 'report' || kind === 'digest' ? configFor(configs.current, pr?.repo ?? '').reportModel : ''
+    const model = kind === 'report' || kind === 'digest' ? reportModelLabel(configFor(configs.current, pr?.repo ?? '')) : ''
     const meta = isHelp ? '' : [model, status === 'loading' ? 'loading…' : status === 'done' ? ago(new Date(panel.at).toISOString(), now) : ''].filter(Boolean).join(' · ')
     const names = { pr: 'PR', report: 'Report', changes: 'Changes since my review', threads: 'Threads' }
-    const title = kind === 'digest' ? 'Digest · what to do first' : kind === 'help' ? 'Keys and symbols' : `${names[kind]} · #${pr?.number} ${pr?.title}`
+    const title =
+      kind === 'digest'
+        ? 'Digest · what to do first'
+        : kind === 'team'
+          ? 'Team · who reviews whom'
+          : kind === 'help'
+            ? 'Keys and symbols'
+            : `${names[kind]} · #${pr?.number} ${pr?.title}`
     const keys = [
       '↑↓ scroll',
       status === 'done' && kind === 'report' ? 'a Ask with report' : null,
@@ -825,7 +1029,7 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
             : [pr?.repo ?? (isAll ? 'all repos' : (scope.current.repo ?? '')), page ? `thread ${pageAt + 1} of ${pages.length}` : ''].filter(Boolean).join(' · ')
         }
         error={status === 'error' ? panel.text : undefined}
-        placeholder={status === 'loading' && !panel.text ? (kind === 'digest' ? 'Weighing your PRs…' : 'Reading the PR…') : undefined}
+        placeholder={status === 'loading' && !panel.text ? (kind === 'digest' ? 'Weighing your PRs…' : kind === 'team' ? 'Reading the open PRs…' : 'Reading the PR…') : undefined}
         body={panelLines}
         top={Math.min(panelTop, panelMax)}
         room={panelRoom}
@@ -889,12 +1093,13 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
     offset.current = last - room + 1
   }
   offset.current = Math.max(0, Math.min(offset.current, lines.length - room))
+  listArea.current = { first: top.length, room }
   const keys = isFiltering
     ? 'type to filter by number, title, author or repo · ↑↓ move · ⏎ keep · esc clear'
     : [
         '↑↓ move · ⏎ fold / view · / filter',
         isAll && !scope.current.repo ? null : `A ${isAll ? 'this repo' : 'all repos'}`,
-        'D digest · u refresh · ? keys · q quit',
+        'D digest · T team · u refresh · S settings · ? keys · q quit',
       ]
         .filter(Boolean)
         .join(' · ')
