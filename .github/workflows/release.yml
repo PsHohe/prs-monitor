@@ -25,7 +25,8 @@ jobs:
   build:
     needs: draft
     strategy:
-      fail-fast: true
+      # Each OS finishes even when another fails, so one run shows every problem; publish still needs all three.
+      fail-fast: false
       matrix:
         os: [macos-14, windows-latest, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
