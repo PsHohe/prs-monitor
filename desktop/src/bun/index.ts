@@ -27,6 +27,12 @@ import { readReviews, writeReview } from './saved'
 if (process.platform !== 'win32') {
   const extra = [join(homedir(), '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', '/home/linuxbrew/.linuxbrew/bin', '/usr/bin']
   process.env.PATH = [...new Set([...(process.env.PATH ?? '').split(delimiter), ...extra])].filter(Boolean).join(delimiter)
+  // Bun.spawn and Bun.which keep the PATH the app started with unless given one, so the shared code gets it here.
+  const { spawn, which } = Bun
+  Object.assign(Bun, {
+    spawn: (command: Parameters<typeof spawn>[0], options?: Parameters<typeof spawn>[1]) => spawn(command, { env: process.env, ...options }),
+    which: (command: string, options?: Parameters<typeof which>[1]) => which(command, { PATH: process.env.PATH, ...options }),
+  })
 }
 
 // Who I am, what was shown and the repos' configs as of the last refresh, for the requests that need them.
