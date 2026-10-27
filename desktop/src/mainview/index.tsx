@@ -84,6 +84,8 @@ function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
   const [repos, setRepos] = useState<DesktopState>({ repos: [], active: null, autoReport: false, providers: [], keepInTray: null })
   const [repoFailure, setRepoFailure] = useState<string | null>(null)
+  // A newer version downloaded by the main process, applied on restart.
+  const [update, setUpdate] = useState<string | null>(null)
   const [counts, setCounts] = useState<Record<string, number>>({})
   const [folded, setFolded] = useState<PrBucket[]>(() => stored('folded', []))
   const [layout, setLayout] = useState<Layout>(() => ({ listWidth: 360, actionsWidth: 260, explainWidth: 440, isListOpen: true, isActionsOpen: true, ...stored('layout', {}) }))
@@ -119,6 +121,7 @@ function App() {
     pushed.onSnapshot = setSnapshot
     pushed.onOpenSettings = () => setIsSettingsOpen(true)
     pushed.onRepos = setRepos
+    pushed.onUpdateReady = setUpdate
     void bun.repos({}).then(setRepos)
     void load(false)
   }, [])
@@ -263,6 +266,14 @@ function App() {
           {repoFailure}{' '}
           <button className="link" onClick={() => setRepoFailure(null)}>
             Dismiss
+          </button>
+        </p>
+      )}
+      {update && (
+        <p className="banner">
+          Version {update} is ready.{' '}
+          <button className="link" onClick={() => void bun.applyUpdate({})}>
+            Restart to update
           </button>
         </p>
       )}

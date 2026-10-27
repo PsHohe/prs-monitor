@@ -63,6 +63,8 @@ export type PrsRpc = {
       stopExplain: { params: { key: string; findingId: number }; response: boolean }
       // A double click on the app's top bar, which stands in for the title bar.
       titleBarDoubleClick: { params: {}; response: boolean }
+      // Restarts into the downloaded update.
+      applyUpdate: { params: {}; response: boolean }
     }
     messages: {}
   }
@@ -77,6 +79,8 @@ export type PrsRpc = {
       openSettings: {}
       // The repo list and app settings, changed outside the webview (the question on the first close).
       repos: DesktopState
+      // A newer version, downloaded and ready once the app restarts.
+      updateReady: { version: string }
     }
   }
 }

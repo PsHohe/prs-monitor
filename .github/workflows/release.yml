@@ -1,0 +1,81 @@
+# Builds the desktop app on each OS for a v* tag and publishes them together as the latest release,
+# which installed apps check for updates (release.baseUrl in desktop/electrobun.config.ts).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches the app version
+        run: |
+          version=$(grep -oE "version: '[^']+'" desktop/electrobun.config.ts | cut -d"'" -f2)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "Tag $GITHUB_REF_NAME but the app is $version"; exit 1; }
+      - run: gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: draft
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [macos-14, windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      ELECTROBUN_DEVELOPER_ID: ${{ secrets.ELECTROBUN_DEVELOPER_ID }}
+      ELECTROBUN_TEAMID: ${{ secrets.ELECTROBUN_TEAMID }}
+      ELECTROBUN_APPLEID: ${{ secrets.ELECTROBUN_APPLEID }}
+      ELECTROBUN_APPLEIDPASS: ${{ secrets.ELECTROBUN_APPLEIDPASS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      # The app bundles the CLI's code from ../src, with its dependencies.
+      - run: bun install --frozen-lockfile
+
+      - name: Install Hutch
+        if: runner.os != 'Windows'
+        run: |
+          curl -fsSL https://hutch.blackboard.sh/hutch/install.sh | sh -s -- --version 0.28.2 --no-modify-path
+          echo "$HOME/.hutch/bin" >> "$GITHUB_PATH"
+      - name: Install Hutch
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ([scriptblock]::Create((irm https://hutch.blackboard.sh/hutch/install.ps1))) -Version 0.28.2 -NoModifyPath
+          "$HOME\.hutch\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Import the Developer ID certificate
+        if: runner.os == 'macOS' && env.ELECTROBUN_DEVELOPER_ID != ''
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          p12-password: ${{ secrets.MAC_CERT_PASSWORD }}
+
+      - name: Build
+        working-directory: desktop
+        run: |
+          hutch run install
+          hutch run build
+      - name: Upload to the draft release
+        run: gh release upload "$GITHUB_REF_NAME" desktop/artifacts/* --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+        env:
+          GH_TOKEN: ${{ github.token }}

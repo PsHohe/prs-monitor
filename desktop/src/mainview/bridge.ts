@@ -12,6 +12,7 @@ export const pushed = {
   onExplain: (_update: ExplainUpdate) => {},
   onOpenSettings: () => {},
   onRepos: (_state: DesktopState) => {},
+  onUpdateReady: (_version: string) => {},
 }
 
 const rpc = Electroview.defineRPC<PrsRpc>({
@@ -25,6 +26,7 @@ const rpc = Electroview.defineRPC<PrsRpc>({
       explain: update => pushed.onExplain(update),
       openSettings: () => pushed.onOpenSettings(),
       repos: state => pushed.onRepos(state),
+      updateReady: ({ version }) => pushed.onUpdateReady(version),
     },
   },
 })

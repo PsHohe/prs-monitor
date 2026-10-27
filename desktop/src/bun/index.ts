@@ -1,7 +1,7 @@
 import { homedir } from 'node:os'
 import { delimiter, join } from 'node:path'
 
-import Electrobun, { ApplicationMenu, BrowserView, BrowserWindow, Tray, Utils, type RPCSchema } from 'electrobun/main'
+import Electrobun, { ApplicationMenu, BrowserView, BrowserWindow, Tray, Updater, Utils, type RPCSchema } from 'electrobun/main'
 
 import { codexModels, quickReport } from '../../../src/ai'
 import { copy } from '../../../src/actions'
@@ -405,6 +405,12 @@ const rpc = BrowserView.defineRPC<{ bun: RPCSchema<PrsRpc['bun']>; webview: RPCS
       settings: () => settings(),
       saveSettings: ({ values }) => saveSettings(values),
       titleBarDoubleClick: () => titleBarDoubleClick(),
+      applyUpdate: async () => {
+        isQuitting = true
+        await Updater.applyUpdate()
+
+        return true
+      },
     },
     messages: {},
   },
@@ -548,3 +554,23 @@ setInterval(async () => {
     window.webview.rpc?.send.snapshot(snapshot)
   }
 }, pollMs)
+
+// Downloads a newer release in the background and offers a restart; dev builds never find one.
+async function checkForUpdate(): Promise<void> {
+  try {
+    if (!(await Updater.checkForUpdate()).updateAvailable) {
+      return
+    }
+    await Updater.downloadUpdate()
+    const { updateReady, version } = Updater.updateInfo()
+    if (updateReady) {
+      window.webview.rpc?.send.updateReady({ version })
+    }
+  } catch (error) {
+    console.error('Update check failed:', error)
+  }
+}
+
+// Waits for the webview to be listening before the first check.
+setTimeout(checkForUpdate, 30 * 1000)
+setInterval(checkForUpdate, 4 * 60 * 60 * 1000)
