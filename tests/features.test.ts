@@ -7,6 +7,7 @@ import {
   digestPrompt,
   extraChips,
   mergeConfig,
+  newCiFailures,
   owedReplies,
   parseConfigFile,
   repliesPrompt,
@@ -24,6 +25,7 @@ import {
   toRow,
 } from '../src/lib/lib'
 import type { ChangesData, Conversation, RawPr, RowOptions, TeamPr, ThreadDetail, ThreadSummary } from '../src/lib/lib'
+import { announcements } from '../src/monitor'
 
 const PLAIN: RowOptions = { automated: null, ticket: null, flakyChecks: [] }
 const NOW = Date.parse('2026-10-07T12:00:00Z')
@@ -380,4 +382,33 @@ test('team: requests older than two days are flagged, and the reader shows as yo
   expect(text[1]).toContain('you')
   expect(text.find(line => line.startsWith('bo'))).toContain('oldest 3d ⚠')
   expect(text.some(line => line.includes('◆ bo → #1 T by you'))).toBe(true)
+})
+
+test('CI failures notify once per push on my PRs, not for flaky checks, snoozed PRs or the first load', () => {
+  const mine = (over: Partial<RawPr>) =>
+    toRow(raw({ author: { login: 'me' }, headRefOid: 'a1', ...over }), 'me', {}, { ...PLAIN, flakyChecks: ['e2e'] })
+  const failing = (name: string) => [{ name, status: 'COMPLETED', conclusion: 'FAILURE' }]
+  const passing = mine({ statusCheckRollup: [{ name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' }] })
+  const broken = mine({ statusCheckRollup: failing('build') })
+  const flaky = mine({ statusCheckRollup: failing('e2e') })
+
+  expect(newCiFailures([passing], [broken]).map(pr => pr.number)).toEqual([broken.number])
+  expect(newCiFailures([broken], [broken])).toEqual([])
+  expect(newCiFailures([broken], [{ ...broken, headOid: 'b2' }])).toHaveLength(1)
+  expect(newCiFailures([flaky], [broken])).toHaveLength(1)
+  expect(newCiFailures([passing], [flaky])).toEqual([])
+  expect(newCiFailures([passing], [{ ...broken, bucket: 'snoozed' }])).toEqual([])
+  expect(newCiFailures([], [broken])).toEqual([])
+  expect(newCiFailures([{ ...passing, isMine: false }], [{ ...broken, isMine: false }])).toEqual([])
+})
+
+test('a refresh announces newly ready PRs, new CI failures and new activity', () => {
+  const pr = toRow(raw({ author: { login: 'me' }, headRefOid: 'a1' }), 'me', {}, PLAIN)
+  const snap = (rows: (typeof pr)[]) => ({ me: 'me', rows, current: null, checkedAt: 1, pausedUntil: null, error: null })
+  const broken = { ...pr, ci: 'fail' as const, failingChecks: ['build'] }
+
+  expect(announcements(snap([pr]), snap([pr]))).toEqual([])
+  expect(announcements(snap([pr]), snap([{ ...pr, bucket: 'ready' }]))).toEqual([`#${pr.number} is ready to merge`])
+  expect(announcements(snap([pr]), snap([broken]))).toEqual([`#${pr.number} CI failed: build`])
+  expect(announcements(snap([pr]), snap([{ ...pr, isNew: true, lastOtherWhat: 'comment' }]))).toEqual([`#${pr.number}: new comment`])
 })

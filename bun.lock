@@ -8,6 +8,7 @@
         "@anthropic-ai/claude-agent-sdk": "^0.3.293",
         "ink": "^8.0.0",
         "react": "^19.3.0",
+        "zod": "4.6.5",
       },
       "devDependencies": {
         "@types/bun": "^1.4.2",

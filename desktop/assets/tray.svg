@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="232 232 560 560">
+  <!-- The app icon's glyph alone, black on clear: macOS tints it as a template image for the menu bar. -->
+  <g fill="none" stroke="#000" stroke-width="60" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="352" y1="372" x2="352" y2="652"/>
+    <circle cx="352" cy="312" r="60"/>
+    <circle cx="352" cy="712" r="60"/>
+    <path d="M672 652 V430 a82 82 0 0 0 -82 -82 H492"/>
+    <path d="M552 288 L492 348 L552 408"/>
+    <circle cx="672" cy="712" r="60" fill="#000"/>
+  </g>
+</svg>

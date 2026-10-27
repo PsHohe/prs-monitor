@@ -8,9 +8,10 @@ import type { ChangesData, Conversation, GqlPr, MergedPr, PrThreads, SharedCache
 
 export type RunResult = { exitCode: number; stdout: string; stderr: string }
 
-export async function run(argv: string[], cwd?: string): Promise<RunResult> {
+// input is written to the command's stdin.
+export async function run(argv: string[], cwd?: string, input?: string): Promise<RunResult> {
   try {
-    const proc = Bun.spawn(argv, { cwd, stdout: 'pipe', stderr: 'pipe', timeout: 30000 })
+    const proc = Bun.spawn(argv, { cwd, stdin: input === undefined ? 'ignore' : new Blob([input]), stdout: 'pipe', stderr: 'pipe', timeout: 30000 })
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
@@ -455,6 +456,37 @@ export async function replyToThread(threadId: string, body: string): Promise<Don
   const query = 'mutation($id: ID!, $body: String!) { addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $id, body: $body }) { comment { id } } }'
 
   return done(await gh(['api', 'graphql', '-f', `query=${query}`, '-f', `id=${threadId}`, '-f', `body=${body}`]), 'Reply posted')
+}
+
+// Creates a review on the PR from GitHub's request body (see reviewPayload); url is where it shows on GitHub.
+export async function postReview(repo: string, number: number, payload: Record<string, unknown>): Promise<Done & { url: string | null }> {
+  // GitHub refuses a review on a commit that is no longer the head; say which commits came since, before trying.
+  const head = await gh(['pr', 'view', String(number), '--repo', repo, '--json', 'headRefOid,commits'])
+  if (head.exitCode === 0) {
+    const pr = JSON.parse(head.stdout) as { headRefOid: string; commits: { oid: string; messageHeadline: string }[] }
+    if (pr.headRefOid !== payload.commit_id) {
+      const at = pr.commits.findIndex(commit => commit.oid === payload.commit_id)
+      const since = at >= 0 ? pr.commits.slice(at + 1) : []
+      const listed = since.map(commit => `${commit.oid.slice(0, 7)} ${commit.messageHeadline}`).join('; ')
+
+      return {
+        ok: false,
+        text: `New commits were pushed after this review${listed ? ` (${listed})` : ''}. Refresh, Re-review them, then draft again.`,
+        url: null,
+      }
+    }
+  }
+  const result = await run(['gh', 'api', '-X', 'POST', `repos/${repo}/pulls/${number}/reviews`, '--input', '-', '--jq', '.html_url'], undefined, JSON.stringify(payload))
+  const isPending = !('event' in payload)
+  if (result.exitCode !== 0) {
+    // gh prints the API's message, which says why (one pending review per PR, approving my own PR…).
+    const message = /"message":\s*"([^"]+)"/.exec(result.stdout)?.[1] ?? (result.stderr.trim().split('\n')[0] || 'gh failed')
+    const reason = /"errors":\s*\[\s*"([^"]+)"/.exec(result.stdout)?.[1]
+
+    return { ok: false, text: reason ? `${message}: ${reason}` : message, url: null }
+  }
+
+  return { ok: true, text: isPending ? 'Pending review created; finish it on GitHub' : 'Review submitted', url: result.stdout.trim() || null }
 }
 
 export async function resolveThread(threadId: string): Promise<Done> {

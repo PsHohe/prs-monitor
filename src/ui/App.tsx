@@ -49,7 +49,7 @@ import {
   tomorrowMorning,
 } from '../lib/lib'
 import type { Chip, Config, ThreadDetail } from '../lib/lib'
-import { configFor, HOME_CONFIG, loadConfigs, refresh, saveHomeSettings, sortRows } from '../monitor'
+import { announcements, configFor, HOME_CONFIG, loadConfigs, refresh, saveHomeSettings, sortRows } from '../monitor'
 import type { Configs, RefreshOptions, Scope, Snapshot } from '../monitor'
 import { markdownLines } from './markdown'
 import { useMouse } from './mouse'
@@ -185,7 +185,7 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
         lastRefreshAt.current = next.checkedAt
       }
       if (!isQuiet && before?.checkedAt && next.checkedAt !== before.checkedAt) {
-        announce(before, next)
+        announcements(before, next).forEach(notify)
       }
     } catch (err) {
       if (attempt === epoch.current) {
@@ -1118,18 +1118,4 @@ export function App({ initialScope, initialConfigs, initialState }: Props) {
       {footer(keys)}
     </Box>
   )
-}
-
-function announce(before: Snapshot, next: Snapshot): void {
-  const key = (pr: PrRow) => rowKey(pr)
-  const wasNew = new Set(before.rows.filter(pr => pr.isNew).map(key))
-  const wasReady = new Set(before.rows.filter(pr => pr.bucket === 'ready').map(key))
-  for (const pr of next.rows.filter(one => one.bucket === 'ready' && !wasReady.has(key(one)))) {
-    notify(`#${pr.number} is ready to merge`)
-  }
-  const fresh = next.rows.filter(pr => pr.isNew && !wasNew.has(key(pr)))
-  const first = fresh[0]
-  if (first) {
-    notify(fresh.length === 1 ? `#${first.number}: new ${first.lastOtherWhat ?? 'activity'}` : `${fresh.length} PRs have new activity`)
-  }
 }

@@ -45,7 +45,7 @@ Prompts go to the clipboard: paste them into whichever Claude session you want. 
 
 A review thread waits for your reply (`↩`, and the PR moves to "waiting on me") when it is unresolved and someone else wrote last: any thread on your PR, or one you started on someone else's. Your own comments matching `automated_comments` don't count as replies.
 
-While open, the view checks every minute whether the poll interval passed or the branch changed, and sends a terminal notification (OSC 9: iTerm2, Ghostty, WezTerm, kitty; `herdr notification show` inside herdr) on new activity or when a PR becomes ready to merge. Clicking it focuses the terminal.
+While open, the view checks every minute whether the poll interval passed or the branch changed, and sends a terminal notification (OSC 9: iTerm2, Ghostty, WezTerm, kitty; `herdr notification show` inside herdr) on new activity, when a PR becomes ready to merge, or when CI starts failing on one of your PRs (once per push; checks in `flaky_checks` and snoozed PRs don't count). Clicking it focuses the terminal.
 
 ## Status line
 

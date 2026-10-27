@@ -7,6 +7,9 @@ export type Config = {
   // The Claude model; Codex has its own key so a repo's Claude model never reaches Codex. '' is Codex's default.
   reportModel: string
   codexModel: string
+  // The AI review's Claude model and effort, apart from the report's: a full review is worth more thought.
+  reviewModel: string
+  reviewEffort: Effort
   automatedComments: string | null
   ticketPattern: string | null
   twinBases: string[]
@@ -18,12 +21,17 @@ export type Config = {
 export type ReportProvider = 'claude' | 'codex'
 export const REPORT_PROVIDERS: ReportProvider[] = ['claude', 'codex']
 
+export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export type Effort = (typeof EFFORTS)[number]
+
 export const DEFAULT_CONFIG: Config = {
   pollMinutes: 3,
   onNewReview: 'notify',
   reportProvider: 'claude',
   reportModel: 'sonnet',
   codexModel: '',
+  reviewModel: 'opus',
+  reviewEffort: 'high',
   automatedComments: null,
   ticketPattern: null,
   twinBases: [],
@@ -123,6 +131,7 @@ export function mergeConfig(files: ConfigFile[]): Config {
     const review = v.on_new_review
     const merge = v.merge_method
     const provider = v.report_provider
+    const effort = EFFORTS.find(one => one === v.review_effort)
 
     return {
       pollMinutes: minutes(v.poll_interval) ?? config.pollMinutes,
@@ -130,6 +139,8 @@ export function mergeConfig(files: ConfigFile[]): Config {
       reportProvider: provider === 'claude' || provider === 'codex' ? provider : config.reportProvider,
       reportModel: v.report_model || config.reportModel,
       codexModel: v.codex_model ?? config.codexModel,
+      reviewModel: v.review_model || config.reviewModel,
+      reviewEffort: effort ?? config.reviewEffort,
       automatedComments: v.automated_comments ?? config.automatedComments,
       ticketPattern: v.ticket_pattern ?? config.ticketPattern,
       twinBases: list(v.twin_bases) ?? config.twinBases,
@@ -681,6 +692,19 @@ export function alertOf(current: PrRow | null, rows: PrRow[], now: number): Aler
   const done = ready[0]
 
   return done ? { kind: 'ready', pr: done, text: 'ready to merge', more: ready.length - 1 } : null
+}
+
+// My PRs whose CI started failing since the last refresh: on a check that is not only flaky, or again on a new push.
+// Snoozed PRs and PRs not seen before are left out, so the first load stays quiet.
+export function newCiFailures(before: PrRow[], next: PrRow[]): PrRow[] {
+  const isBlocking = (pr: PrRow) => pr.ci === 'fail' && !pr.isFlakyOnly
+  const was = new Map(before.map(pr => [rowKey(pr), pr]))
+
+  return next.filter(pr => {
+    const old = was.get(rowKey(pr))
+
+    return pr.isMine && pr.bucket !== 'snoozed' && isBlocking(pr) && !!old && (!isBlocking(old) || old.headOid !== pr.headOid)
+  })
 }
 
 function withGuidance(text: string, guidance: string | undefined): string {

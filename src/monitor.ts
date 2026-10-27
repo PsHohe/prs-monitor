@@ -9,9 +9,11 @@ import {
   fromGraphql,
   linkRows,
   mergeConfig,
+  newCiFailures,
   parseConfigFile,
   pauseAfter,
   RATE_BACKOFF_MS,
+  rowKey,
   setFrontmatter,
   toRow,
 } from './lib/lib'
@@ -299,4 +301,19 @@ export function sortRows(rows: PrRow[]): PrRow[] {
       Number(b.isNew) - Number(a.isNew) ||
       (b.lastOtherAt ?? '').localeCompare(a.lastOtherAt ?? ''),
   )
+}
+
+// What changed between two refreshes that is worth a notification: PRs ready to merge, my CI failing, new activity.
+export function announcements(before: Snapshot, next: Snapshot): string[] {
+  const wasNew = new Set(before.rows.filter(pr => pr.isNew).map(rowKey))
+  const wasReady = new Set(before.rows.filter(pr => pr.bucket === 'ready').map(rowKey))
+  const ready = next.rows.filter(pr => pr.bucket === 'ready' && !wasReady.has(rowKey(pr))).map(pr => `#${pr.number} is ready to merge`)
+  const withCurrent = (snap: Snapshot) =>
+    snap.current && !snap.rows.some(pr => rowKey(pr) === rowKey(snap.current!)) ? [...snap.rows, snap.current] : snap.rows
+  const failed = newCiFailures(withCurrent(before), withCurrent(next)).map(pr => `#${pr.number} CI failed: ${pr.failingChecks.join(', ')}`)
+  const fresh = next.rows.filter(pr => pr.isNew && !wasNew.has(rowKey(pr)))
+  const first = fresh[0]
+  const activity = first ? [fresh.length === 1 ? `#${first.number}: new ${first.lastOtherWhat ?? 'activity'}` : `${fresh.length} PRs have new activity`] : []
+
+  return [...ready, ...failed, ...activity]
 }
