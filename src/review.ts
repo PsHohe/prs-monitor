@@ -3,7 +3,9 @@ import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 
 import { fetchThreads, gh, run } from './github'
-import type { Config } from './lib/lib'
+import { addressPrompt, addressSystem, recordPlan } from './lib/address'
+import type { AddressState, PlanFields } from './lib/address'
+import type { Config, ReviewThread, ThreadDetail } from './lib/lib'
 import { commentableLines, explainPrompt, explainSystem, followUpPrompt, priorPrompt, rereviewPrompt, revisedPrompt, reviewBook, reviewPrompt, reviewSystem } from './lib/review'
 import type { Assessment, ExplainStart, FindingFields, ReviewBook, Reviewed, ReviewInput, ReviewMessage, ReviewStart, ReviewState, Triage } from './lib/review'
 import { openClaude } from './review-claude'
@@ -31,6 +33,8 @@ export type EngineHooks = {
   book: ReviewBook | null
   // An explanation's verdict on its finding; null for the review.
   onAssess: ((assessment: Assessment) => string) | null
+  // What to do about one of the threads waiting on me; null but when answering them.
+  onPlan: ((plan: PlanFields) => string) | null
   onActivity: (activity: string) => void
   // isNewBlock starts a new paragraph of the answer.
   onText: (text: string, isNewBlock: boolean) => void
@@ -79,6 +83,7 @@ export function openReview(
   const hooks: EngineHooks = {
     book,
     onAssess: null,
+    onPlan: null,
     onActivity: activity => {
       state.activity = activity
       update()
@@ -231,6 +236,7 @@ export function openExplain(
   }
   const hooks: EngineHooks = {
     book: null,
+    onPlan: null,
     onAssess: assessment => {
       state.assessment = { ...assessment, at: state.messages.length - 1 }
       update()
@@ -305,11 +311,90 @@ export function openExplain(
   }
 }
 
-async function reviewInput(repo: string, number: number): Promise<ReviewInput | { failure: string }> {
+export type AddressSession = { close: () => void }
+
+// Answers the threads waiting on me in one go, each with a change spec or a reply to post, then ends. threads are the
+// PR's unresolved ones, owed those of them waiting on me; it reads the code in its own checkout like the review.
+export function openAddress(
+  repo: string,
+  number: number,
+  config: Config,
+  root: string | null,
+  threads: { all: ThreadDetail[]; owed: ThreadDetail[]; isMine: boolean },
+  onUpdate: (state: AddressState) => void,
+): AddressSession {
+  const state: AddressState = { plans: [], count: threads.owed.length, isBusy: true, failure: null, hasCode: null, activity: null, commitId: null }
+  const update = () => onUpdate({ ...state, plans: [...state.plans] })
+  queueMicrotask(update)
+  let engine: ReviewEngine | null = null
+  let worktree: Worktree | null = null
+  let isClosed = false
+
+  const end = () => {
+    isClosed = true
+    engine?.close()
+    void worktree?.remove()
+  }
+  const finish = (failure: string | null) => {
+    state.isBusy = false
+    state.failure = failure
+    state.activity = null
+    update()
+    end()
+  }
+  const hooks: EngineHooks = {
+    book: null,
+    onAssess: null,
+    onPlan: (plan: PlanFields) => {
+      const result = recordPlan(state, threads.owed, threads.isMine, plan)
+      update()
+
+      return result
+    },
+    onActivity: activity => {
+      state.activity = activity
+      update()
+    },
+    // Its answer is only "Done.": the plans are what it gives.
+    onText: () => {},
+    onDone: (failure, isStopped) => {
+      const missing = state.count - state.plans.length
+      finish(failure ?? (isStopped ? null : missing > 0 ? `The model answered ${state.plans.length} of ${state.count} threads` : null))
+    },
+    onEnd: () => {
+      if (state.isBusy) {
+        finish('The session ended')
+      }
+    },
+  }
+
+  void (async () => {
+    const [input, checkedOut] = await Promise.all([reviewInput(repo, number, threads.all), root ? checkout(root, repo, number) : null])
+    worktree = checkedOut
+    if (isClosed || 'failure' in input) {
+      end()
+      if ('failure' in input) {
+        finish(input.failure)
+      }
+      return
+    }
+    state.commitId = input.headSha
+    state.hasCode = !!worktree
+    update()
+    const kind = config.reportProvider === 'codex' ? 'codex' : 'claude'
+    engine = (kind === 'codex' ? openCodex : openClaude)({ config, dir: worktree?.dir ?? null, system: addressSystem(!!worktree, threads.isMine, kind) }, hooks)
+    engine.send(addressPrompt({ ...input, guide: worktree ? await guideIn(worktree.dir) : null }, threads.owed))
+  })()
+
+  return { close: end }
+}
+
+// known is the PR's threads when the caller has them already, which saves asking GitHub again.
+async function reviewInput(repo: string, number: number, known?: ReviewThread[]): Promise<ReviewInput | { failure: string }> {
   const [viewed, diff, threads] = await Promise.all([
     gh(['pr', 'view', String(number), '--repo', repo, '--json', 'title,body,author,baseRefName,headRefName,headRefOid']),
     gh(['pr', 'diff', String(number), '--repo', repo]),
-    fetchThreads(repo, number),
+    known ? { threads: known } : fetchThreads(repo, number),
   ])
   if (viewed.exitCode !== 0) {
     return { failure: viewed.stderr.trim() || 'gh pr view failed' }

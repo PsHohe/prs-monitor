@@ -4,6 +4,8 @@ import { join } from 'node:path'
 
 import type { Subprocess } from 'bun'
 
+import { ADDRESS_SCHEMA } from './lib/address'
+import type { CodexAddressTurn } from './lib/address'
 import type { Effort } from './lib/lib'
 import { applyTurn, assessmentOf, EXPLAIN_SCHEMA, REVIEW_SCHEMA } from './lib/review'
 import type { CodexExplainTurn, CodexTurn } from './lib/review'
@@ -26,12 +28,12 @@ type CodexEvent = {
 export function openCodex({ config, dir, system }: EngineOptions, hooks: EngineHooks): ReviewEngine {
   const codex = Bun.which('codex')!
   const cwd = dir ?? tmpdir()
-  const { book, onAssess } = hooks
-  // Codex reads the schema from a file: the review's changes, or an explanation's answer and verdict.
+  const { book, onAssess, onPlan } = hooks
+  // Codex reads the schema from a file: the review's changes, an explanation's answer and verdict, or the threads' plans.
   const schema = (async () => {
     const folder = await mkdtemp(join(tmpdir(), 'prs-review-schema-'))
     const path = join(folder, 'schema.json')
-    await Bun.write(path, JSON.stringify(book ? REVIEW_SCHEMA : EXPLAIN_SCHEMA))
+    await Bun.write(path, JSON.stringify(book ? REVIEW_SCHEMA : onPlan ? ADDRESS_SCHEMA : EXPLAIN_SCHEMA))
 
     return { folder, path }
   })()
@@ -97,13 +99,16 @@ export function openCodex({ config, dir, system }: EngineOptions, hooks: EngineH
       hooks.onDone(null, true)
       return
     }
-    const parsed = book ? parseTurn(last) : parseExplainTurn(last)
+    const parsed = book ? parseTurn(last) : onPlan ? parseAddressTurn(last) : parseExplainTurn(last)
     if (!parsed) {
       const stderr = (await new Response(proc.stderr).text()).trim().split('\n').pop()
       hooks.onDone(`The model did not answer (${failure || (last ? 'its answer was not the expected JSON' : stderr || `codex exited with ${exitCode}`)})`, false)
       return
     }
     unapplied = book && 'new_findings' in parsed ? applyTurn(book, parsed) : []
+    if (onPlan && 'plans' in parsed) {
+      unapplied = parsed.plans.map(onPlan).filter(result => !result.startsWith('Recorded'))
+    }
     if (onAssess && 'assessment' in parsed && parsed.assessment) {
       onAssess(assessmentOf(parsed.assessment))
     }
@@ -143,6 +148,15 @@ function parseTurn(text: string): CodexTurn | null {
   try {
     const value = JSON.parse(text) as CodexTurn
     return Array.isArray(value.new_findings) && typeof value.answer === 'string' ? value : null
+  } catch {
+    return null
+  }
+}
+
+function parseAddressTurn(text: string): CodexAddressTurn | null {
+  try {
+    const value = JSON.parse(text) as CodexAddressTurn
+    return Array.isArray(value.plans) && typeof value.answer === 'string' ? value : null
   } catch {
     return null
   }

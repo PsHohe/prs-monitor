@@ -113,6 +113,9 @@ const CODEX_OUTPUT = `You have no tools for the review itself. Wherever these in
 
 export type Engine = 'claude' | 'codex'
 
+// What the model can see and do, for a session that reads the code but does not review it.
+export const codeAccess = (hasCode: boolean, engine: Engine) => (!hasCode ? DIFF_ONLY : engine === 'codex' ? READ_CODE_CODEX : READ_CODE)
+
 export function reviewSystem(hasCode: boolean, engine: Engine = 'claude'): string {
   const access = !hasCode ? DIFF_ONLY : `${engine === 'codex' ? READ_CODE_CODEX : READ_CODE}\n\n${USE_CODE}`
   const output = engine === 'codex' ? `\n\n${CODEX_OUTPUT}` : ''
@@ -154,7 +157,7 @@ const CODEX_ASSESS = `You have no tools to assess the finding. Wherever these in
 // A side conversation that explains one finding to me before I decide on it. It reads the code like the review, but
 // cannot change the review: it proposes a revision with assess_finding, and I decide on the card.
 export function explainSystem(hasCode: boolean, engine: Engine = 'claude'): string {
-  const access = !hasCode ? DIFF_ONLY : engine === 'codex' ? READ_CODE_CODEX : READ_CODE
+  const access = codeAccess(hasCode, engine)
   const output = engine === 'codex' ? `\n\n${CODEX_ASSESS}` : ''
 
   return `You are a senior engineer helping me understand one finding from an AI review of a pull request, before I decide whether to keep it, dismiss it or act on it. ${access}

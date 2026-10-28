@@ -2006,3 +2006,38 @@ kbd {
   padding: 3px 12px;
   font-size: 13px;
 }
+
+/* The AI's call on a thread waiting on me, under its comments. */
+.plan {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.plan-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.plan-head .spacer {
+  flex: 1;
+}
+
+.plan-summary {
+  margin: 0;
+}
+
+.plan-toggle {
+  align-self: flex-start;
+  font-size: 12px;
+}
+
+.plan .md {
+  margin: 0;
+}

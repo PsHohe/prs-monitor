@@ -5,10 +5,11 @@ import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import type { CanUseTool, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 
+import { PLAN_ACTIONS } from './lib/address'
 import { ASSESSMENTS, assessmentOf, CATEGORIES, describeTool, isReadOnlyCommand, SEVERITIES, SUGGESTION_LIMIT, VERDICTS } from './lib/review'
 import type { EngineHooks, EngineOptions, ReviewEngine } from './review'
 
-const REVIEW_TOOLS = ['report_finding', 'update_finding', 'withdraw_finding', 'mark_addressed', 'report_summary', 'draft_review', 'suggest_next', 'assess_finding'].map(
+const REVIEW_TOOLS = ['report_finding', 'update_finding', 'withdraw_finding', 'mark_addressed', 'report_summary', 'draft_review', 'suggest_next', 'assess_finding', 'plan_thread'].map(
   name => `mcp__review__${name}`,
 )
 
@@ -26,7 +27,7 @@ const FIELDS = {
 // The review through the Agent SDK: one long session that changes the review with tools as it goes, and streams its
 // answers. With the checkout, it reads the code like Claude Code would, read-only.
 export function openClaude({ config, dir, system }: EngineOptions, hooks: EngineHooks): ReviewEngine {
-  const { book, onAssess } = hooks
+  const { book, onAssess, onPlan } = hooks
   const recorded = (text: string) => ({ content: [{ type: 'text' as const, text }] })
   const optional = {
     severity: FIELDS.severity.optional(),
@@ -49,6 +50,21 @@ export function openClaude({ config, dir, system }: EngineOptions, hooks: Engine
         revision: z.object(optional).nullable().describe('For refined: only the fields that change, rewritten whole; null otherwise'),
       },
       async args => recorded(onAssess(assessmentOf(args))),
+    ),
+  ]
+  // Answering the threads that wait on me has only their plans to give.
+  const planning = onPlan && [
+    tool(
+      'plan_thread',
+      'Say what to do about one thread: a change with its spec, or a reply to post.',
+      {
+        thread: z.number().int().describe("The thread's number"),
+        action: z.enum(PLAN_ACTIONS),
+        summary: z.string().describe('What the thread asks and your call, in one sentence to me'),
+        reply: z.string().describe('For reply: what I would post, in markdown; empty otherwise'),
+        spec: z.string().describe('For change: the change spec, in markdown; empty otherwise'),
+      },
+      async args => recorded(onPlan(args)),
     ),
   ]
   const reviewing = book && [
@@ -111,7 +127,7 @@ export function openClaude({ config, dir, system }: EngineOptions, hooks: Engine
       async ({ suggestions }) => recorded(book.suggest(suggestions)),
     ),
   ]
-  const tools = assessing ?? reviewing
+  const tools = assessing ?? planning ?? reviewing
   const server = tools && createSdkMcpServer({ name: 'review', tools })
 
   // My messages, handed to the SDK one at a time as I send them; streaming input also lets SDK tools run.

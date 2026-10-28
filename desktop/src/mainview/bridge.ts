@@ -2,7 +2,7 @@ import Electrobun, { Electroview } from 'electrobun/view'
 
 import type { Snapshot } from '../../../src/monitor'
 import type { DesktopState } from '../shared/repos'
-import type { ExplainUpdate, PrsRpc, ReportUpdate, ReviewUpdate } from '../shared/rpc'
+import type { AddressUpdate, ExplainUpdate, PrsRpc, ReportUpdate, ReviewUpdate } from '../shared/rpc'
 
 // Snapshots the main process pushes on its own schedule, and reports and reviews as they are written; listeners are set once mounted.
 export const pushed = {
@@ -10,6 +10,7 @@ export const pushed = {
   onReport: (_update: ReportUpdate) => {},
   onReview: (_update: ReviewUpdate) => {},
   onExplain: (_update: ExplainUpdate) => {},
+  onAddress: (_update: AddressUpdate) => {},
   onOpenSettings: () => {},
   onRepos: (_state: DesktopState) => {},
   onUpdateReady: (_version: string) => {},
@@ -24,6 +25,7 @@ const rpc = Electroview.defineRPC<PrsRpc>({
       report: update => pushed.onReport(update),
       review: update => pushed.onReview(update),
       explain: update => pushed.onExplain(update),
+      address: update => pushed.onAddress(update),
       openSettings: () => pushed.onOpenSettings(),
       repos: state => pushed.onRepos(state),
       updateReady: ({ version }) => pushed.onUpdateReady(version),

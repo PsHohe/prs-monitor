@@ -6,6 +6,7 @@ import type { PrRow } from '../../../src/types'
 import { reasonsOf } from '../shared/attention'
 import { ACTIONS, EXPLAIN } from '../shared/layout'
 import { Actions } from './Actions'
+import { startAddress, useAddress } from './addresses'
 import { bun } from './bridge'
 import { Avatar, Chips } from './Chips'
 import { Timeline } from './Conversation'
@@ -50,6 +51,7 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
   const unresolved = threads.data ? threads.data.pages.length : pr.unresolved
   const report = useReport(pr)
   const review = useReview(pr)
+  const address = useAddress(pr)
   const explained = useExplaining(pr)
   const isExplaining = explained !== null && !!review?.explains[explained]
   const toTriage = review ? review.findings.filter(finding => isOpenFinding(finding) && !review.triage[finding.id]).length : 0
@@ -57,6 +59,14 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
   const reply = () => {
     setTab('threads')
     setFocusSignal(n => n + 1)
+  }
+
+  // Opens the threads with the AI's drafts for those waiting on me, asking for them the first time.
+  const openAddress = () => {
+    setTab('threads')
+    if (!address) {
+      startAddress(pr)
+    }
   }
 
   // Opens the review tab, starting a review when there is none yet.
@@ -82,6 +92,8 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
         startReport(pr)
       } else if (event.key === 'v' && isAiOn) {
         openReview()
+      } else if (event.key === 'a' && isAiOn && owed > 0) {
+        openAddress()
       } else if (event.key === 'r' && owed > 0) {
         reply()
       } else {
@@ -200,7 +212,9 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
           {tab === 'threads' &&
             (threads.data ? (
               <Threads
+                pr={pr}
                 data={threads.data}
+                isAiOn={isAiOn}
                 now={now}
                 focusSignal={focusSignal}
                 onChanged={() => {
@@ -228,7 +242,7 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
         <>
           <Splitter width={actionsWidth} min={ACTIONS.min} max={actionsMax} side="right" label="Resize the actions" onWidth={onActionsWidth} />
           <aside className="pane actions-pane" style={{ width: actionsWidth }}>
-            <Actions pr={pr} isAiOn={isAiOn} onReply={reply} onReview={openReview} />
+            <Actions pr={pr} isAiOn={isAiOn} onReply={reply} onAddress={openAddress} onReview={openReview} />
           </aside>
         </>
         )

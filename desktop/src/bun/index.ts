@@ -12,12 +12,12 @@ import { reviewPayload } from '../../../src/lib/review'
 import type { ExplainStart, ReviewStart, ReviewState, Triage } from '../../../src/lib/review'
 import { announcements, configFor, detectScope, HOME_CONFIG, loadConfig, loadConfigs, refresh, saveHomeSettings } from '../../../src/monitor'
 import type { Configs, Scope, Snapshot } from '../../../src/monitor'
-import { openExplain, openReview } from '../../../src/review'
-import type { ExplainSession, ExplainState, ReviewSession } from '../../../src/review'
+import { openAddress, openExplain, openReview } from '../../../src/review'
+import type { AddressSession, ExplainSession, ExplainState, ReviewSession } from '../../../src/review'
 import type { PrRow } from '../../../src/types'
 import { providerFor, withoutRepo, withRepo } from '../shared/repos'
 import type { DesktopState } from '../shared/repos'
-import type { PrsRpc, ReportUpdate, Settings, ThreadsData } from '../shared/rpc'
+import type { AddressUpdate, PrsRpc, ReportUpdate, Settings, ThreadsData } from '../shared/rpc'
 import { readDesktopState, repoAt, scopeOf, writeDesktopState } from './repos'
 import { readFrame, writeFrame } from './frame'
 import { fetchImage } from './image'
@@ -280,6 +280,48 @@ function sendExplain(pr: PrRow, start: ExplainStart & { text: string }): boolean
   return true
 }
 
+// The drafts being made for the threads waiting on me, by row key.
+const addressing = new Map<string, AddressSession>()
+
+async function startAddress(pr: PrRow): Promise<boolean> {
+  const key = rowKey(pr)
+  addressing.get(key)?.close()
+  addressing.delete(key)
+  const { config, model, failure } = await reviewer(pr)
+  const send = (state: Omit<AddressUpdate, 'key' | 'model'>) => window.webview.rpc?.send.address({ key, model, ...state })
+  const stopped = (why: string) => send({ plans: [], count: 0, isBusy: false, failure: why, hasCode: null, activity: null, commitId: null })
+  if (failure) {
+    stopped(failure)
+    return true
+  }
+  const [data, root] = await Promise.all([threads(pr), cloneOf(pr)])
+  if ('failure' in data) {
+    stopped(data.failure)
+    return true
+  }
+  const owed = data.pages.filter(page => page.isOwed).map(page => page.thread)
+  if (owed.length === 0) {
+    stopped('No threads are waiting for your reply')
+    return true
+  }
+  // Nothing reaches the webview from drafts that were replaced or cancelled.
+  const session: AddressSession = openAddress(pr.repo, pr.number, config, root, { all: data.pages.map(page => page.thread), owed, isMine: pr.isMine }, state => {
+    if (addressing.get(key) === session) {
+      send(state)
+    }
+  })
+  addressing.set(key, session)
+
+  return true
+}
+
+function cancelAddress(key: string): boolean {
+  addressing.get(key)?.close()
+  addressing.delete(key)
+
+  return true
+}
+
 // Asked once: listing Codex's models runs the codex CLI.
 let codexList: Promise<string[]> | null = null
 
@@ -413,6 +455,12 @@ const rpc = BrowserView.defineRPC<{ bun: RPCSchema<PrsRpc['bun']>; webview: RPCS
 
         return true
       },
+      startAddress: ({ pr }) => {
+        void startAddress(pr)
+
+        return true
+      },
+      cancelAddress: ({ key }) => cancelAddress(key),
       settings: () => settings(),
       saveSettings: ({ values }) => saveSettings(values),
       titleBarDoubleClick: () => titleBarDoubleClick(),

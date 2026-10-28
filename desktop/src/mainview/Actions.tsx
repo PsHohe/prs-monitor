@@ -1,13 +1,15 @@
 import type { PrRow } from '../../../src/types'
+import { useAddress } from './addresses'
 import { bun } from './bridge'
 import { startReport, useReport } from './reports'
 import { useReview } from './reviews'
 
-type Props = { pr: PrRow; isAiOn: boolean; onReply: () => void; onReview: () => void }
+type Props = { pr: PrRow; isAiOn: boolean; onReply: () => void; onAddress: () => void; onReview: () => void }
 
 // What can be done with the selected PR, each with its key.
-export function Actions({ pr, isAiOn, onReply, onReview }: Props) {
+export function Actions({ pr, isAiOn, onReply, onAddress, onReview }: Props) {
   const report = useReport(pr)
+  const address = useAddress(pr)
   const review = useReview(pr)
   const owed = pr.replies?.length ?? 0
   const isWriting = !!report && !report.isDone
@@ -21,6 +23,9 @@ export function Actions({ pr, isAiOn, onReply, onReview }: Props) {
       {isAiOn && (
         <section className="card">
           <Action label={isWriting ? 'Writing report…' : report ? 'Rewrite AI report' : 'Write AI report'} shortcut="g" isDisabled={isWriting} onClick={() => startReport(pr)} />
+          {owed > 0 && (
+            <Action label={!address ? 'Draft answers with AI' : address.isBusy ? 'Drafting answers…' : 'Show drafted answers'} shortcut="a" onClick={onAddress} />
+          )}
           <Action label={!review ? 'Start AI review' : review.isBusy && review.turn === 0 ? 'Reviewing…' : 'Show AI review'} shortcut="v" onClick={onReview} />
         </section>
       )}

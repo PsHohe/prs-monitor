@@ -1,4 +1,5 @@
 import type { Done } from '../../../src/github'
+import type { AddressState } from '../../../src/lib/address'
 import type { Conversation, Effort, ReportProvider, ThreadDetail } from '../../../src/lib/lib'
 import type { ExplainStart, FindingFields, ReviewDraft, ReviewStart, ReviewState, Triage } from '../../../src/lib/review'
 import type { ExplainState } from '../../../src/review'
@@ -63,6 +64,9 @@ export type PrsRpc = {
       stopExplain: { params: { key: string; findingId: number }; response: boolean }
       // My revision of a finding from its explanation, for the open review session to keep and tell the model.
       reviseFinding: { params: { key: string; findingId: number; changes: Partial<FindingFields> }; response: boolean }
+      // Drafts what to do about each thread waiting on me, replacing the drafts being made; they arrive as address messages.
+      startAddress: { params: { pr: PrRow }; response: boolean }
+      cancelAddress: { params: { key: string }; response: boolean }
       // A double click on the app's top bar, which stands in for the title bar.
       titleBarDoubleClick: { params: {}; response: boolean }
       // Restarts into the downloaded update.
@@ -77,6 +81,7 @@ export type PrsRpc = {
       report: ReportUpdate
       review: ReviewUpdate
       explain: ExplainUpdate
+      address: AddressUpdate
       // The app menu's Settings item.
       openSettings: {}
       // The repo list and app settings, changed outside the webview (the question on the first close).
@@ -97,6 +102,9 @@ export type ReviewUpdate = ReviewState & { key: string; model: string }
 
 // The explanation of one finding of the review for the PR with this row key.
 export type ExplainUpdate = ExplainState & { key: string; findingId: number; model: string }
+
+// The drafts for the threads waiting on me in the PR with this row key.
+export type AddressUpdate = AddressState & { key: string; model: string }
 
 // settled is what I did with the verdict given at that message: applied its revision (before is what the fields were,
 // to undo it) or ignored it. One for an earlier verdict no longer counts.
