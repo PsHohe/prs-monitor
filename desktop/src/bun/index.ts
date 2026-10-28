@@ -391,6 +391,26 @@ async function changeRepos(change: (state: DesktopState) => DesktopState): Promi
   return next
 }
 
+// Something I did on GitHub (a review, a reply, a resolved thread) changes where the PR stands, so the list asks
+// GitHub again at once instead of waiting for the next poll.
+async function reloadAfter<T extends { ok: boolean }>(action: Promise<T>): Promise<T> {
+  const done = await action
+  // A failed refresh leaves the list as it was, for the next poll.
+  if (done.ok) {
+    void pushSnapshot(0).catch(() => {})
+  }
+
+  return done
+}
+
+async function pushSnapshot(maxAgeMs: number): Promise<void> {
+  const started = generation
+  const snapshot = await load(maxAgeMs)
+  if (started === generation) {
+    window.webview.rpc?.send.snapshot(snapshot)
+  }
+}
+
 const rpc = BrowserView.defineRPC<{ bun: RPCSchema<PrsRpc['bun']>; webview: RPCSchema<PrsRpc['webview']> }>({
   maxRequestTime: 60 * 1000,
   handlers: {
@@ -403,8 +423,8 @@ const rpc = BrowserView.defineRPC<{ bun: RPCSchema<PrsRpc['bun']>; webview: RPCS
       conversation: ({ pr }) => fetchConversation(pr, 0),
       threads: ({ pr }) => threads(pr),
       diff: ({ pr }) => diff(pr),
-      reply: ({ threadId, body }) => replyToThread(threadId, body),
-      resolve: ({ threadId }) => resolveThread(threadId),
+      reply: ({ threadId, body }) => reloadAfter(replyToThread(threadId, body)),
+      resolve: ({ threadId }) => reloadAfter(resolveThread(threadId)),
       repos: () => readDesktopState(),
       addRepo: () => addRepo(),
       removeRepo: ({ repo }) => changeRepos(state => withoutRepo(state, repo)),
@@ -442,7 +462,7 @@ const rpc = BrowserView.defineRPC<{ bun: RPCSchema<PrsRpc['bun']>; webview: RPCS
 
         return head.exitCode === 0 ? head.stdout.trim() || null : null
       },
-      postReview: ({ pr, draft, submit }) => postReview(pr.repo, pr.number, reviewPayload(draft, submit)),
+      postReview: ({ pr, draft, submit }) => reloadAfter(postReview(pr.repo, pr.number, reviewPayload(draft, submit))),
       stopReview: ({ key }) => {
         reviews.get(key)?.stop()
 
@@ -615,13 +635,7 @@ showTray((await readDesktopState()).keepInTray === true)
 
 // Same cadence as the TUI; the shared cache keeps the CLI and this app from asking GitHub twice.
 const pollMs = (await loadConfig(null)).pollMinutes * 60 * 1000
-setInterval(async () => {
-  const started = generation
-  const snapshot = await load(pollMs)
-  if (started === generation) {
-    window.webview.rpc?.send.snapshot(snapshot)
-  }
-}, pollMs)
+setInterval(() => void pushSnapshot(pollMs), pollMs)
 
 // Downloads a newer release in the background and offers a restart; dev builds never find one.
 async function checkForUpdate(): Promise<void> {

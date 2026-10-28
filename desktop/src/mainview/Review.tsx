@@ -61,7 +61,8 @@ export function ReviewPanel({ pr, now }: Props) {
 
   const key = rowKey(pr)
   const isReviewing = review.isBusy && review.turn === 0
-  const isStale = review.stamp !== stampOf(pr)
+  // Posting it changes the PR's review state, which is no news about the PR.
+  const isStale = review.stamp !== stampOf(pr) && !review.posted
   // New commits since the review looked, which a re-review settles the findings against.
   const hasNewCommits = !!review.commitId && !!pr.headOid && review.commitId !== pr.headOid
   const count = review.findings.length
