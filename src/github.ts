@@ -471,7 +471,7 @@ export async function postReview(repo: string, number: number, payload: Record<s
 
       return {
         ok: false,
-        text: `New commits were pushed after this review${listed ? ` (${listed})` : ''}. Refresh, Re-review them, then draft again.`,
+        text: `New commits were pushed after this review${listed ? ` (${listed})` : ''}. Send the review any message, or Re-review, and it reads them; then draft again.`,
         url: null,
       }
     }

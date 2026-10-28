@@ -69,6 +69,10 @@ export function openReview(
   let isClosed = false
   // The findings I revised since my last message, which it has not heard of.
   const revised = new Set<number>()
+  // Set when I stop the answer while it still catches up with new commits, before the model has my message; what
+  // changed in them then waits for my next one.
+  let isStopping = false
+  let untold: string | null = null
 
   const finish = (failure: string | null) => {
     state.isBusy = false
@@ -111,6 +115,34 @@ export function openReview(
     },
   }
 
+  // Places the review on the PR's head; when that moved since the review last looked, drops the draft made on the old
+  // commits and says what changed, for the model.
+  const moveTo = async (input: ReviewInput): Promise<string | null> => {
+    const from = state.commitId
+    reviewed = { commitId: input.headSha, lines: commentableLines(input.diff) }
+    state.commitId = input.headSha
+    if (!from || from === input.headSha) {
+      return null
+    }
+    state.draft = null
+    if (state.turn > 0) {
+      state.messages.at(-1)?.changes.push(`Now on ${input.headSha.slice(0, 7)}`)
+    }
+    const since = await changesSince(repo, from, input.headSha, worktree?.dir ?? null)
+
+    return rereviewPrompt(since?.diff ?? null, since?.commits ?? null)
+  }
+  // Before my message, so that whatever I ask about, and any draft, is on the commits pushed since.
+  const catchUp = async (): Promise<string | null> => {
+    const head = await gh(['pr', 'view', String(number), '--repo', repo, '--json', 'headRefOid', '--jq', '.headRefOid'])
+    if (head.exitCode !== 0 || head.stdout.trim() === state.commitId) {
+      return null
+    }
+    const [input] = await Promise.all([reviewInput(repo, number), worktree?.update()])
+
+    return 'failure' in input ? null : moveTo(input)
+  }
+
   void (async () => {
     const [input, checkedOut] = await Promise.all([reviewInput(repo, number), root ? checkout(root, repo, number) : null])
     worktree = checkedOut
@@ -121,9 +153,7 @@ export function openReview(
       }
       return
     }
-    reviewed = { commitId: input.headSha, lines: commentableLines(input.diff) }
-    const since = start.kind === 'rereview' && state.commitId ? await changesSince(repo, state.commitId, input.headSha, worktree?.dir ?? null) : null
-    state.commitId = input.headSha
+    const moved = await moveTo(input)
     state.hasCode = !!worktree
     update()
     const kind = config.reportProvider === 'codex' ? 'codex' : 'claude'
@@ -136,7 +166,9 @@ export function openReview(
         : [
             pr,
             priorPrompt(start.prior, start.triage),
-            start.kind === 'continue' ? followUpPrompt(start.text, start.refs, start.prior.findings, start.triage) : rereviewPrompt(since?.diff ?? null, since?.commits ?? null),
+            ...(start.kind === 'continue'
+              ? [...(moved ? [moved] : []), followUpPrompt(start.text, start.refs, start.prior.findings, start.triage)]
+              : [moved ?? rereviewPrompt(null, null)]),
           ].join('\n\n'),
     )
   })()
@@ -148,6 +180,7 @@ export function openReview(
         return false
       }
       state.turn++
+      isStopping = false
       state.messages.push({ role: 'me', text: text.trim(), refs, changes: [] }, { role: 'ai', text: '', refs: [], changes: [] })
       state.isBusy = true
       state.failure = null
@@ -156,12 +189,29 @@ export function openReview(
       update()
       const told = state.findings.filter(finding => revised.has(finding.id))
       revised.clear()
-      engine.send([...(told.length > 0 ? [revisedPrompt(told)] : []), followUpPrompt(text, refs, state.findings, triage)].join('\n\n'))
+      const current = engine
+      void (async () => {
+        const moved = (await catchUp()) ?? untold
+        untold = null
+        if (isClosed) {
+          return
+        }
+        if (isStopping) {
+          isStopping = false
+          untold = moved
+          answer()?.changes.push('Stopped')
+          finish(null)
+          return
+        }
+        update()
+        current.send([...(told.length > 0 ? [revisedPrompt(told)] : []), ...(moved ? [moved] : []), followUpPrompt(text, refs, state.findings, triage)].join('\n\n'))
+      })()
 
       return true
     },
     stop: () => {
       if (state.isBusy && state.turn > 0) {
+        isStopping = true
         engine?.stop()
       }
     },
@@ -457,7 +507,8 @@ async function changesSince(repo: string, from: string, to: string, dir: string 
   return diff.exitCode === 0 ? { diff: diff.stdout, commits: count.exitCode === 0 ? Number(count.stdout.trim()) : null } : null
 }
 
-type Worktree = { dir: string; remove: () => Promise<void> }
+// update moves it to the PR's head as it is now.
+type Worktree = { dir: string; update: () => Promise<void>; remove: () => Promise<void> }
 
 // The checkouts of the reviews open in this process; any other is left from one that quit mid-review.
 const checkouts = new Set<string>()
@@ -476,21 +527,13 @@ async function removeLeftovers(root: string) {
 // A detached checkout of the PR's head beside my clone, so the review reads the code without touching my working
 // tree; null when it cannot be made, and the review reads only the diff.
 async function checkout(root: string, repo: string, number: number): Promise<Worktree | null> {
-  // The remote that is the PR's repo, which is not origin in a fork's clone.
-  const remotes = await run(['git', 'remote', '-v'], root)
-  const remote =
-    remotes.stdout
-      .split('\n')
-      .map(line => line.split(/\s+/))
-      .find(([, url]) => !!url && url.toLowerCase().replace(/\.git$/, '').endsWith(repo.toLowerCase()))?.[0] ?? 'origin'
-  const fetched = await run(['git', 'fetch', '--no-tags', '--quiet', remote, `pull/${number}/head`], root)
-  const head = fetched.exitCode === 0 ? await run(['git', 'rev-parse', 'FETCH_HEAD'], root) : null
-  if (!head || head.exitCode !== 0) {
+  const head = await fetchHead(root, repo, number)
+  if (!head) {
     return null
   }
   await removeLeftovers(root)
   const dir = await realpath(await mkdtemp(join(tmpdir(), 'prs-review-')))
-  const added = await run(['git', 'worktree', 'add', '--detach', '--quiet', dir, head.stdout.trim()], root)
+  const added = await run(['git', 'worktree', 'add', '--detach', '--quiet', dir, head], root)
   checkouts.add(dir)
   const remove = async () => {
     await run(['git', 'worktree', 'remove', '--force', dir], root)
@@ -500,8 +543,29 @@ async function checkout(root: string, repo: string, number: number): Promise<Wor
     await remove()
     return null
   }
+  const update = async () => {
+    const now = await fetchHead(root, repo, number)
+    if (now) {
+      await run(['git', 'checkout', '--detach', '--quiet', now], dir)
+    }
+  }
 
-  return { dir, remove }
+  return { dir, update, remove }
+}
+
+// Fetches the PR's head into my clone; its commit, or null when it cannot be fetched.
+async function fetchHead(root: string, repo: string, number: number): Promise<string | null> {
+  // The remote that is the PR's repo, which is not origin in a fork's clone.
+  const remotes = await run(['git', 'remote', '-v'], root)
+  const remote =
+    remotes.stdout
+      .split('\n')
+      .map(line => line.split(/\s+/))
+      .find(([, url]) => !!url && url.toLowerCase().replace(/\.git$/, '').endsWith(repo.toLowerCase()))?.[0] ?? 'origin'
+  const fetched = await run(['git', 'fetch', '--no-tags', '--quiet', remote, `pull/${number}/head`], root)
+  const head = fetched.exitCode === 0 ? await run(['git', 'rev-parse', 'FETCH_HEAD'], root) : null
+
+  return head?.exitCode === 0 ? head.stdout.trim() : null
 }
 
 // The checkout's instructions for agents, read as text: the model follows its conventions but does not run anything from it.

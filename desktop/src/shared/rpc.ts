@@ -53,6 +53,8 @@ export type PrsRpc = {
       saveReview: { params: { key: string; review: SavedReview | null }; response: boolean }
       // Stops the model's current answer; the review stays open.
       stopReview: { params: { key: string }; response: boolean }
+      // The PR's head commit on GitHub now; null when GitHub cannot be reached.
+      prHead: { params: { pr: PrRow }; response: string | null }
       // Posts the draft as I edited it: submitted with its verdict, or pending for me to finish on GitHub.
       postReview: { params: { pr: PrRow; draft: ReviewDraft; submit: boolean }; response: Done & { url: string | null } }
       // Explains a finding of the PR's review in a side conversation, replacing the one open for it; the answer

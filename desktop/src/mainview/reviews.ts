@@ -5,7 +5,7 @@ import type { ExplainStart, FindingFields, ReviewDraft, ReviewState, Triage } fr
 import type { PrRow } from '../../../src/types'
 import type { SavedReview } from '../shared/rpc'
 import { bun, pushed } from './bridge'
-import { stampOf } from './remote'
+import { restamp, stampOf } from './remote'
 
 export type Review = SavedReview
 
@@ -41,10 +41,13 @@ const change = (pr: PrRow, edit: (review: Review) => Partial<Review>) => {
   }
 }
 
+// A review that moved on to new commits by itself is not stale for them, and what I posted was for the old ones.
 pushed.onReview = ({ key, ...update }) => {
   const review = reviews.get(key)
   if (review) {
-    reviews.set(key, { ...review, ...update })
+    const isMoved = !!update.commitId && !!review.commitId && update.commitId !== review.commitId
+    const moved = isMoved ? { stamp: restamp(review.stamp, update.commitId!), posted: null } : {}
+    reviews.set(key, { ...review, ...update, ...moved })
     changed(key)
   }
 }
@@ -126,6 +129,22 @@ export function rereview(pr: PrRow): void {
   // The draft, and so what I posted of it, belongs to the commits reviewed before.
   change(pr, () => ({ stamp: stampOf(pr), at: new Date().toISOString(), isBusy: true, failure: null, selected: [], posted: null }))
   void bun.startReview({ pr, start: { kind: 'rereview', prior: stateOf(review), triage: review.triage } })
+}
+
+// Asks GitHub whether commits came since the review looked, without waiting for the list to refresh, and re-reviews
+// them if so; else says why nothing happened.
+export async function checkCommits(pr: PrRow): Promise<string | null> {
+  const head = await bun.prHead({ pr })
+  const review = reviews.get(rowKey(pr))
+  if (!head) {
+    return 'Could not reach GitHub.'
+  }
+  if (!review || review.isBusy || head === review.commitId) {
+    return review?.isBusy ? null : 'No new commits since this review.'
+  }
+  rereview(pr)
+
+  return null
 }
 
 // Cancels the review being made, and forgets it.

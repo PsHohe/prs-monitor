@@ -10,6 +10,8 @@ const cache = new Map<string, { stamp: string; data: unknown }>()
 
 // What the PR looked like: a change means new activity, so what was fetched about it is out of date.
 export const stampOf = (pr: PrRow) => [pr.headOid, pr.lastOtherAt, pr.unresolved, pr.review].join('|')
+// The stamp once something fetched about the PR was brought up to the head commit given.
+export const restamp = (stamp: string, headOid: string) => [headOid, ...stamp.split('|').slice(1)].join('|')
 
 // Fetches something about a PR once it stays selected for a moment, so stepping through the
 // list with the keyboard does not ask GitHub about every PR passed.

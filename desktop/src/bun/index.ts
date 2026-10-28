@@ -437,6 +437,11 @@ const rpc = BrowserView.defineRPC<{ bun: RPCSchema<PrsRpc['bun']>; webview: RPCS
 
         return true
       },
+      prHead: async ({ pr }) => {
+        const head = await gh(['pr', 'view', String(pr.number), '--repo', pr.repo, '--json', 'headRefOid', '--jq', '.headRefOid'])
+
+        return head.exitCode === 0 ? head.stdout.trim() || null : null
+      },
       postReview: ({ pr, draft, submit }) => postReview(pr.repo, pr.number, reviewPayload(draft, submit)),
       stopReview: ({ key }) => {
         reviews.get(key)?.stop()

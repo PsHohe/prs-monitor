@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 
-import { ago } from '../../../src/lib/lib'
+import { ago, rowKey } from '../../../src/lib/lib'
 import { findingText, isOpenFinding, VERDICTS } from '../../../src/lib/review'
 import type { Finding, ReviewDraft, ReviewMessage, ReviewSummary, Triage, Verdict } from '../../../src/lib/review'
 import type { PrRow } from '../../../src/types'
@@ -8,7 +8,7 @@ import { bun } from './bridge'
 import { Dialog } from './Dialog'
 import { toHtml } from './markdown'
 import { stampOf } from './remote'
-import { cancelReview, explain, postDraft, rereview, sendMessage, setTriage, startReview, stopAnswer, toggleSelected, useExplaining, useReview, verdictOf } from './reviews'
+import { cancelReview, checkCommits, explain, postDraft, rereview, sendMessage, setTriage, startReview, stopAnswer, toggleSelected, useExplaining, useReview, verdictOf } from './reviews'
 import type { Review } from './reviews'
 
 const VERDICT_NAMES: Record<Verdict, string> = { approve: 'Approve', comment: 'Comment', request_changes: 'Request changes' }
@@ -38,6 +38,8 @@ export function ReviewPanel({ pr, now }: Props) {
   const review = useReview(pr)
   const explained = useExplaining(pr)
   const [isShowingAside, setIsShowingAside] = useState(false)
+  // What Check for new commits found, for the PR and the turn it was about; null while it checks.
+  const [checked, setChecked] = useState<{ key: string; turn: number; text: string | null } | null>(null)
 
   if (!review) {
     return (
@@ -57,6 +59,7 @@ export function ReviewPanel({ pr, now }: Props) {
     )
   }
 
+  const key = rowKey(pr)
   const isReviewing = review.isBusy && review.turn === 0
   const isStale = review.stamp !== stampOf(pr)
   // New commits since the review looked, which a re-review settles the findings against.
@@ -89,11 +92,27 @@ export function ReviewPanel({ pr, now }: Props) {
               Cancel
             </button>
           ) : (
-            <button className="link" onClick={() => startReview(pr)} title="Start over; this clears the conversation and your triage">
-              {review.failure && !canTalk ? 'Try again' : 'Review again'}
-            </button>
+            <>
+              {canTalk && !review.isBusy && (
+                <button
+                  className="link"
+                  disabled={checked?.key === key && checked.text === null}
+                  onClick={() => {
+                    setChecked({ key, turn: review.turn, text: null })
+                    void checkCommits(pr).then(text => setChecked({ key, turn: review.turn, text }))
+                  }}
+                  title="Ask GitHub for commits pushed since this review, and re-review them; your triage stays"
+                >
+                  {checked?.key === key && checked.text === null ? 'Checking…' : 'Check for new commits'}
+                </button>
+              )}
+              <button className="link" onClick={() => startReview(pr)} title="Start over; this clears the conversation and your triage">
+                {review.failure && !canTalk ? 'Try again' : 'Review again'}
+              </button>
+            </>
           )}
         </div>
+        {checked?.key === key && checked.turn === review.turn && checked.text && !review.isBusy && <p className="notice muted">{checked.text}</p>}
         {hasNewCommits && !review.isBusy && canTalk ? (
           <div className="actions notice">
             <span className="muted">New commits since this review.</span>
