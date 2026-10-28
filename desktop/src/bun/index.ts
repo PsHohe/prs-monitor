@@ -24,8 +24,12 @@ import { fetchImage } from './image'
 import { readReviews, writeReview } from './saved'
 
 // Apps opened from Finder or a desktop launcher get a minimal PATH, so gh, git, claude and codex would not be found.
-if (process.platform !== 'win32') {
-  const extra = [join(homedir(), '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', '/home/linuxbrew/.linuxbrew/bin', '/usr/bin']
+// On Windows the PATH is fixed at launch, so gh's install folder is added for a gh installed while the app runs.
+{
+  const extra =
+    process.platform === 'win32'
+      ? [join(process.env.ProgramFiles ?? 'C:\\Program Files', 'GitHub CLI')]
+      : [join(homedir(), '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', '/home/linuxbrew/.linuxbrew/bin', '/snap/bin', '/usr/bin']
   process.env.PATH = [...new Set([...(process.env.PATH ?? '').split(delimiter), ...extra])].filter(Boolean).join(delimiter)
   // Bun.spawn and Bun.which keep the PATH the app started with unless given one, so the shared code gets it here.
   const { spawn, which } = Bun
