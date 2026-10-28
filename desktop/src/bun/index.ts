@@ -256,7 +256,7 @@ async function startExplain(pr: PrRow, start: ExplainStart): Promise<boolean> {
   const send = (state: ExplainState) => window.webview.rpc?.send.explain({ key, findingId, model, ...state })
   if (failure) {
     const messages = [...start.prior, ...(start.text ? [{ role: 'me' as const, text: start.text, refs: [], changes: [] }] : [])]
-    send({ messages, isBusy: false, failure, hasCode: null, activity: null })
+    send({ messages, isBusy: false, failure, hasCode: null, activity: null, assessment: null })
   } else {
     const root = await cloneOf(pr)
     const session: ExplainSession = openExplain(pr.repo, pr.number, config, root, start, state => {
@@ -405,6 +405,11 @@ const rpc = BrowserView.defineRPC<{ bun: RPCSchema<PrsRpc['bun']>; webview: RPCS
       sendExplain: ({ pr, start }) => sendExplain(pr, start),
       stopExplain: ({ key, findingId }) => {
         explains.get(explainKey(key, findingId))?.stop()
+
+        return true
+      },
+      reviseFinding: ({ key, findingId, changes }) => {
+        reviews.get(key)?.revise(findingId, changes)
 
         return true
       },

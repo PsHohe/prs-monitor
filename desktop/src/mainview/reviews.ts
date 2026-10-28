@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from 'react'
 
 import { rowKey } from '../../../src/lib/lib'
-import type { ExplainStart, ReviewDraft, ReviewState, Triage } from '../../../src/lib/review'
+import type { ExplainStart, FindingFields, ReviewDraft, ReviewState, Triage } from '../../../src/lib/review'
 import type { PrRow } from '../../../src/types'
 import type { SavedReview } from '../shared/rpc'
 import { bun, pushed } from './bridge'
@@ -49,11 +49,14 @@ pushed.onReview = ({ key, ...update }) => {
   }
 }
 
-// An explanation for a finding the review no longer has (it started over) is dropped.
+// An explanation for a finding the review no longer has (it started over) is dropped. A session carrying on from an
+// ended one starts without its verdict, so the last one stands until it gives another; what I did with it is mine.
 pushed.onExplain = ({ key, findingId, ...thread }) => {
   const review = reviews.get(key)
   if (review?.findings.some(finding => finding.id === findingId)) {
-    reviews.set(key, { ...review, explains: { ...review.explains, [findingId]: thread } })
+    const previous = review.explains[findingId]
+    const merged = { ...thread, assessment: thread.assessment ?? previous?.assessment ?? null, settled: previous?.settled ?? null }
+    reviews.set(key, { ...review, explains: { ...review.explains, [findingId]: merged } })
     changed(key)
   }
 }
@@ -182,18 +185,32 @@ export function useExplaining(pr: PrRow | null): number | null {
   return useSyncExternalStore(subscribe, () => (key ? (explaining.get(key) ?? null) : null))
 }
 
-const explainStart = (review: Review, id: number, text: string | null): ExplainStart => ({
-  finding: review.findings.find(finding => finding.id === id)!,
-  summary: review.summary,
-  triage: review.triage[id] ?? null,
-  // An answer that failed or never came says nothing to carry on.
-  prior: (review.explains[id]?.messages ?? []).filter(message => message.text.trim()),
-  text,
-})
+// The explanation's latest verdict on the finding, and what I did with it; null until it gives one.
+export function verdictOf(review: Review, id: number) {
+  const thread = review.explains[id]
+  const assessment = thread?.assessment ?? null
+  const settled = assessment && thread?.settled?.at === assessment.at ? thread.settled : null
+
+  return assessment ? { ...assessment, settled } : null
+}
+
+const explainStart = (review: Review, id: number, text: string | null): ExplainStart => {
+  const verdict = verdictOf(review, id)
+
+  return {
+    finding: review.findings.find(finding => finding.id === id)!,
+    summary: review.summary,
+    triage: review.triage[id] ?? null,
+    // An answer that failed or never came says nothing to carry on.
+    prior: (review.explains[id]?.messages ?? []).filter(message => message.text.trim()),
+    assessed: verdict && { verdict: verdict.verdict, settled: verdict.settled?.state ?? null },
+    text,
+  }
+}
 
 const changeExplain = (pr: PrRow, id: number, edit: Partial<Review['explains'][number]>) =>
   change(pr, review => {
-    const thread = review.explains[id] ?? { messages: [], isBusy: false, failure: null, hasCode: null, activity: null, model: review.model }
+    const thread = review.explains[id] ?? { messages: [], isBusy: false, failure: null, hasCode: null, activity: null, assessment: null, settled: null, model: review.model }
 
     return { explains: { ...review.explains, [id]: { ...thread, ...edit } } }
   })
@@ -219,8 +236,8 @@ export function restartExplain(pr: PrRow, id: number): void {
   if (!review) {
     return
   }
-  const start = { ...explainStart(review, id, null), prior: [] }
-  changeExplain(pr, id, { messages: [{ role: 'ai', text: '', refs: [], changes: [] }], isBusy: true, failure: null, activity: null })
+  const start = { ...explainStart(review, id, null), prior: [], assessed: null }
+  changeExplain(pr, id, { messages: [{ role: 'ai', text: '', refs: [], changes: [] }], isBusy: true, failure: null, activity: null, assessment: null, settled: null })
   void bun.startExplain({ pr, start })
 }
 
@@ -244,4 +261,39 @@ export async function askExplain(pr: PrRow, id: number, text: string): Promise<v
 
 export function stopExplain(pr: PrRow, id: number): void {
   void bun.stopExplain({ key: rowKey(pr), findingId: id })
+}
+
+// Changes the finding here and in the open review session, which tells the model with my next message.
+function reviseFinding(pr: PrRow, id: number, changes: Partial<FindingFields>): void {
+  change(pr, review => ({ findings: review.findings.map(finding => (finding.id === id ? { ...finding, ...changes } : finding)) }))
+  void bun.reviseFinding({ key: rowKey(pr), findingId: id, changes })
+}
+
+// Applies the explanation's revision to the finding, keeping what the fields were to undo it.
+export function applyRevision(pr: PrRow, id: number): void {
+  const review = reviews.get(rowKey(pr))
+  const finding = review?.findings.find(one => one.id === id)
+  const assessment = review?.explains[id]?.assessment
+  if (!finding || !assessment?.revision) {
+    return
+  }
+  const before = Object.fromEntries(Object.keys(assessment.revision).map(field => [field, finding[field as keyof FindingFields]]))
+  reviseFinding(pr, id, assessment.revision)
+  changeExplain(pr, id, { settled: { at: assessment.at, state: 'applied', before } })
+}
+
+export function ignoreVerdict(pr: PrRow, id: number): void {
+  const assessment = reviews.get(rowKey(pr))?.explains[id]?.assessment
+  if (assessment) {
+    changeExplain(pr, id, { settled: { at: assessment.at, state: 'ignored', before: null } })
+  }
+}
+
+// Puts the finding back as it was when I applied the revision, or the verdict back to decide on.
+export function undoVerdict(pr: PrRow, id: number): void {
+  const settled = reviews.get(rowKey(pr))?.explains[id]?.settled
+  if (settled?.before) {
+    reviseFinding(pr, id, settled.before)
+  }
+  changeExplain(pr, id, { settled: null })
 }

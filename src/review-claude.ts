@@ -5,10 +5,12 @@ import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import type { CanUseTool, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 
-import { CATEGORIES, describeTool, isReadOnlyCommand, SEVERITIES, SUGGESTION_LIMIT, VERDICTS } from './lib/review'
+import { ASSESSMENTS, assessmentOf, CATEGORIES, describeTool, isReadOnlyCommand, SEVERITIES, SUGGESTION_LIMIT, VERDICTS } from './lib/review'
 import type { EngineHooks, EngineOptions, ReviewEngine } from './review'
 
-const REVIEW_TOOLS = ['report_finding', 'update_finding', 'withdraw_finding', 'mark_addressed', 'report_summary', 'draft_review', 'suggest_next'].map(name => `mcp__review__${name}`)
+const REVIEW_TOOLS = ['report_finding', 'update_finding', 'withdraw_finding', 'mark_addressed', 'report_summary', 'draft_review', 'suggest_next', 'assess_finding'].map(
+  name => `mcp__review__${name}`,
+)
 
 const FIELDS = {
   severity: z.enum(SEVERITIES),
@@ -24,82 +26,93 @@ const FIELDS = {
 // The review through the Agent SDK: one long session that changes the review with tools as it goes, and streams its
 // answers. With the checkout, it reads the code like Claude Code would, read-only.
 export function openClaude({ config, dir, system }: EngineOptions, hooks: EngineHooks): ReviewEngine {
-  const { book } = hooks
+  const { book, onAssess } = hooks
   const recorded = (text: string) => ({ content: [{ type: 'text' as const, text }] })
-  // Without the book (an explanation), the model only reads and answers.
-  const server = book && createSdkMcpServer({
-    name: 'review',
-    tools: [
-      tool('report_finding', 'Report one new review finding, most important first.', FIELDS, async args => recorded(book.report(args))),
-      tool(
-        'update_finding',
-        'Revise a finding: pass its id and only the fields that change.',
-        {
-          id: z.number().int(),
-          severity: FIELDS.severity.optional(),
-          category: FIELDS.category.optional(),
-          path: FIELDS.path.optional(),
-          line: FIELDS.line.optional(),
-          title: FIELDS.title.optional(),
-          body: FIELDS.body.optional(),
-          suggestion: FIELDS.suggestion.optional(),
-          confidence: FIELDS.confidence.optional(),
-        },
-        async ({ id, ...changes }) => recorded(book.revise(id, changes)),
-      ),
-      tool(
-        'withdraw_finding',
-        'Take back a finding that does not hold up.',
-        { id: z.number().int(), reason: z.string().describe('Why, in one sentence') },
-        async ({ id, reason }) => recorded(book.withdraw(id, reason)),
-      ),
-      tool(
-        'mark_addressed',
-        'Close a finding that commits since the review fixed.',
-        { id: z.number().int(), how: z.string().describe('How the new code addresses it, in one sentence') },
-        async ({ id, how }) => recorded(book.address(id, how)),
-      ),
-      tool(
-        'report_summary',
-        'Report the overall verdict once every finding is reported; again later only if it changes.',
-        {
-          verdict: z.enum(VERDICTS),
-          overview: z.string().describe('Two or three sentences'),
-          risks: z.array(z.string()).describe('The risk areas, a few words each'),
-          notChecked: z.array(z.string()).describe('What could not be checked'),
-        },
-        async args => recorded(book.summarize(args)),
-      ),
-      tool(
-        'draft_review',
-        'Draft the review for GitHub, when I ask for it; I check it and post it myself.',
-        {
-          verdict: z.enum(VERDICTS),
-          body: z.string().describe("The review's body, in markdown"),
-          comments: z
-            .array(z.object({ id: z.number().int().describe('The finding'), body: z.string().describe('The comment to the author, in markdown') }))
-            .describe('One per finding to include'),
-        },
-        async ({ verdict, body, comments }) => recorded(book.draft(verdict, body, comments)),
-      ),
-      tool(
-        'suggest_next',
-        `Offer me up to ${SUGGESTION_LIMIT} next steps as buttons, at the end of every turn; they replace the last ones.`,
-        {
-          suggestions: z
-            .array(
-              z.object({
-                label: z.string().describe('A few words on the button'),
-                text: z.string().describe('The message it sends, written as me'),
-                refs: z.array(z.number().int()).describe('The findings it is about, or none'),
-              }),
-            )
-            .describe('Most useful first; empty when nothing is worth it'),
-        },
-        async ({ suggestions }) => recorded(book.suggest(suggestions)),
-      ),
-    ],
-  })
+  const optional = {
+    severity: FIELDS.severity.optional(),
+    category: FIELDS.category.optional(),
+    path: FIELDS.path.optional(),
+    line: FIELDS.line.optional(),
+    title: FIELDS.title.optional(),
+    body: FIELDS.body.optional(),
+    suggestion: FIELDS.suggestion.optional(),
+    confidence: FIELDS.confidence.optional(),
+  }
+  // An explanation has only its verdict on the finding to give.
+  const assessing = onAssess && [
+    tool(
+      'assess_finding',
+      'Give your verdict on the finding as written, after explaining it; I decide what to do with it.',
+      {
+        verdict: z.enum(ASSESSMENTS),
+        note: z.string().describe('Why, in one sentence written to me'),
+        revision: z.object(optional).nullable().describe('For refined: only the fields that change, rewritten whole; null otherwise'),
+      },
+      async args => recorded(onAssess(assessmentOf(args))),
+    ),
+  ]
+  const reviewing = book && [
+    tool('report_finding', 'Report one new review finding, most important first.', FIELDS, async args => recorded(book.report(args))),
+    tool(
+      'update_finding',
+      'Revise a finding: pass its id and only the fields that change.',
+      { id: z.number().int(), ...optional },
+      async ({ id, ...changes }) => recorded(book.revise(id, changes)),
+    ),
+    tool(
+      'withdraw_finding',
+      'Take back a finding that does not hold up.',
+      { id: z.number().int(), reason: z.string().describe('Why, in one sentence') },
+      async ({ id, reason }) => recorded(book.withdraw(id, reason)),
+    ),
+    tool(
+      'mark_addressed',
+      'Close a finding that commits since the review fixed.',
+      { id: z.number().int(), how: z.string().describe('How the new code addresses it, in one sentence') },
+      async ({ id, how }) => recorded(book.address(id, how)),
+    ),
+    tool(
+      'report_summary',
+      'Report the overall verdict once every finding is reported; again later only if it changes.',
+      {
+        verdict: z.enum(VERDICTS),
+        overview: z.string().describe('Two or three sentences'),
+        risks: z.array(z.string()).describe('The risk areas, a few words each'),
+        notChecked: z.array(z.string()).describe('What could not be checked'),
+      },
+      async args => recorded(book.summarize(args)),
+    ),
+    tool(
+      'draft_review',
+      'Draft the review for GitHub, when I ask for it; I check it and post it myself.',
+      {
+        verdict: z.enum(VERDICTS),
+        body: z.string().describe("The review's body, in markdown"),
+        comments: z
+          .array(z.object({ id: z.number().int().describe('The finding'), body: z.string().describe('The comment to the author, in markdown') }))
+          .describe('One per finding to include'),
+      },
+      async ({ verdict, body, comments }) => recorded(book.draft(verdict, body, comments)),
+    ),
+    tool(
+      'suggest_next',
+      `Offer me up to ${SUGGESTION_LIMIT} next steps as buttons, at the end of every turn; they replace the last ones.`,
+      {
+        suggestions: z
+          .array(
+            z.object({
+              label: z.string().describe('A few words on the button'),
+              text: z.string().describe('The message it sends, written as me'),
+              refs: z.array(z.number().int()).describe('The findings it is about, or none'),
+            }),
+          )
+          .describe('Most useful first; empty when nothing is worth it'),
+      },
+      async ({ suggestions }) => recorded(book.suggest(suggestions)),
+    ),
+  ]
+  const tools = assessing ?? reviewing
+  const server = tools && createSdkMcpServer({ name: 'review', tools })
 
   // My messages, handed to the SDK one at a time as I send them; streaming input also lets SDK tools run.
   const inbox: SDKUserMessage[] = []

@@ -8,7 +8,7 @@ import { bun } from './bridge'
 import { Dialog } from './Dialog'
 import { toHtml } from './markdown'
 import { stampOf } from './remote'
-import { cancelReview, explain, postDraft, rereview, sendMessage, setTriage, startReview, stopAnswer, toggleSelected, useExplaining, useReview } from './reviews'
+import { cancelReview, explain, postDraft, rereview, sendMessage, setTriage, startReview, stopAnswer, toggleSelected, useExplaining, useReview, verdictOf } from './reviews'
 import type { Review } from './reviews'
 
 const VERDICT_NAMES: Record<Verdict, string> = { approve: 'Approve', comment: 'Comment', request_changes: 'Request changes' }
@@ -173,6 +173,8 @@ function Summary({ summary }: { summary: ReviewSummary }) {
 
 type CardProps = { pr: PrRow; review: Review; finding: Finding; isExplained: boolean }
 
+export const VERDICT_LABELS = { holds: 'Holds', refined: 'Refined', disputed: 'Disputed' } as const
+
 function FindingCard({ pr, review, finding, isExplained }: CardProps) {
   const [isOpen, setIsOpen] = useState(false)
   const triage: Triage | null = review.triage[finding.id] ?? null
@@ -186,6 +188,8 @@ function FindingCard({ pr, review, finding, isExplained }: CardProps) {
         : review.turn > 0 && finding.revisedTurn === review.turn && finding.addressed
           ? 'Addressed'
           : null
+  // What its explanation found, until I settle it; then whether I applied its revision.
+  const verdict = verdictOf(review, finding.id)
 
   return (
     <article
@@ -203,6 +207,18 @@ function FindingCard({ pr, review, finding, isExplained }: CardProps) {
         />
         <FindingTags pr={pr} finding={finding} />
         {latest && <span className="badge fresh">{latest}</span>}
+        {verdict?.settled?.state === 'applied' ? (
+          <span className="badge dim" title={verdict.note}>
+            Revised by Explain
+          </span>
+        ) : (
+          verdict &&
+          !verdict.settled && (
+            <span className={`verdict ${verdict.verdict}`} title={verdict.note}>
+              {VERDICT_LABELS[verdict.verdict]}
+            </span>
+          )
+        )}
         <span className="spacer" />
         <span className="muted confidence">{finding.confidence} confidence</span>
       </div>

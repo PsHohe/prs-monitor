@@ -4,8 +4,8 @@ import { basename, join } from 'node:path'
 
 import { fetchThreads, gh, run } from './github'
 import type { Config } from './lib/lib'
-import { commentableLines, explainPrompt, explainSystem, followUpPrompt, priorPrompt, rereviewPrompt, reviewBook, reviewPrompt, reviewSystem } from './lib/review'
-import type { ExplainStart, ReviewBook, Reviewed, ReviewInput, ReviewMessage, ReviewStart, ReviewState, Triage } from './lib/review'
+import { commentableLines, explainPrompt, explainSystem, followUpPrompt, priorPrompt, rereviewPrompt, revisedPrompt, reviewBook, reviewPrompt, reviewSystem } from './lib/review'
+import type { Assessment, ExplainStart, FindingFields, ReviewBook, Reviewed, ReviewInput, ReviewMessage, ReviewStart, ReviewState, Triage } from './lib/review'
 import { openClaude } from './review-claude'
 import { openCodex } from './review-codex'
 
@@ -17,6 +17,8 @@ export type ReviewSession = {
   send: (text: string, refs: number[], triage: Record<number, Triage>) => boolean
   // Stops the model's current answer; the session stays open.
   stop: () => void
+  // My own revision of a finding, from its explanation; the model hears of it with my next message.
+  revise: (id: number, changes: Partial<FindingFields>) => void
   close: () => void
 }
 
@@ -27,6 +29,8 @@ export type EngineOptions = { config: Config; dir: string | null; system: string
 export type EngineHooks = {
   // The review's changes; null for an explanation, which has no tools to change it.
   book: ReviewBook | null
+  // An explanation's verdict on its finding; null for the review.
+  onAssess: ((assessment: Assessment) => string) | null
   onActivity: (activity: string) => void
   // isNewBlock starts a new paragraph of the answer.
   onText: (text: string, isNewBlock: boolean) => void
@@ -59,6 +63,8 @@ export function openReview(
   let engine: ReviewEngine | null = null
   let worktree: Worktree | null = null
   let isClosed = false
+  // The findings I revised since my last message, which it has not heard of.
+  const revised = new Set<number>()
 
   const finish = (failure: string | null) => {
     state.isBusy = false
@@ -72,6 +78,7 @@ export function openReview(
   }
   const hooks: EngineHooks = {
     book,
+    onAssess: null,
     onActivity: activity => {
       state.activity = activity
       update()
@@ -142,13 +149,23 @@ export function openReview(
       // They were for where the review stood; the answer brings new ones.
       state.suggestions = []
       update()
-      engine.send(followUpPrompt(text, refs, state.findings, triage))
+      const told = state.findings.filter(finding => revised.has(finding.id))
+      revised.clear()
+      engine.send([...(told.length > 0 ? [revisedPrompt(told)] : []), followUpPrompt(text, refs, state.findings, triage)].join('\n\n'))
 
       return true
     },
     stop: () => {
       if (state.isBusy && state.turn > 0) {
         engine?.stop()
+      }
+    },
+    revise: (id, changes) => {
+      const finding = state.findings.find(one => one.id === id)
+      if (finding) {
+        Object.assign(finding, changes)
+        revised.add(id)
+        update()
       }
     },
     close: () => {
@@ -158,8 +175,16 @@ export function openReview(
   }
 }
 
-// An explanation as it stands: what we said, the model's answer streaming into the last message.
-export type ExplainState = { messages: ReviewMessage[]; isBusy: boolean; failure: string | null; hasCode: boolean | null; activity: string | null }
+// An explanation as it stands: what we said, the model's answer streaming into the last message, and its latest
+// verdict on the finding, given with the answer at (an index into messages); null until it gives one.
+export type ExplainState = {
+  messages: ReviewMessage[]
+  isBusy: boolean
+  failure: string | null
+  hasCode: boolean | null
+  activity: string | null
+  assessment: (Assessment & { at: number }) | null
+}
 
 export type ExplainSession = {
   isOpen: () => boolean
@@ -186,6 +211,7 @@ export function openExplain(
     failure: null,
     hasCode: null,
     activity: null,
+    assessment: null,
   }
   const update = () => onUpdate({ ...state, messages: state.messages.map(message => ({ ...message })) })
   queueMicrotask(update)
@@ -205,6 +231,12 @@ export function openExplain(
   }
   const hooks: EngineHooks = {
     book: null,
+    onAssess: assessment => {
+      state.assessment = { ...assessment, at: state.messages.length - 1 }
+      update()
+
+      return 'Shown.'
+    },
     onActivity: activity => {
       state.activity = activity
       update()

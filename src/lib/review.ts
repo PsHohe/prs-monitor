@@ -143,25 +143,37 @@ export function findingText(finding: Finding): string {
   return lines.join('\n')
 }
 
+// How an explanation judges the finding once it checked it: it holds as written, it holds but needs the revision, or
+// it does not hold up. note is why, in a sentence; revision is the fields to change, for a refined one.
+export const ASSESSMENTS = ['holds', 'refined', 'disputed'] as const
+export type Assessment = { verdict: (typeof ASSESSMENTS)[number]; note: string; revision: Partial<FindingFields> | null }
+
+// Codex has no tool to assess the finding: its final message carries it, as JSON in EXPLAIN_SCHEMA's shape.
+const CODEX_ASSESS = `You have no tools to assess the finding. Wherever these instructions say to call assess_finding, put the same in your final message instead, which is JSON in the given schema: answer (your explanation, in markdown) and assessment (null when you do not call it), whose revision has null for every field that stays.`
+
 // A side conversation that explains one finding to me before I decide on it. It reads the code like the review, but
-// has no tools to change the review: I decide on the card.
+// cannot change the review: it proposes a revision with assess_finding, and I decide on the card.
 export function explainSystem(hasCode: boolean, engine: Engine = 'claude'): string {
   const access = !hasCode ? DIFF_ONLY : engine === 'codex' ? READ_CODE_CODEX : READ_CODE
+  const output = engine === 'codex' ? `\n\n${CODEX_ASSESS}` : ''
 
   return `You are a senior engineer helping me understand one finding from an AI review of a pull request, before I decide whether to keep it, dismiss it or act on it. ${access}
 
 Explain the finding plainly: what the problem is, where it happens and how the code gets there, what would go wrong and when, and how likely that is. Check it ${hasCode ? 'in the code' : 'against the diff'} rather than taking the finding's word for it: if it does not hold up, or only partly, say so first. When there is a suggested fix, say whether it is right and what else it would touch. Quote only the few lines that matter, with their file and line: the path in the repo as code, never a link.
 
-Answer in markdown, in a few short paragraphs; no headings. You cannot change the review or the code: I decide what to do. I may then ask more; answer what I ask, briefly.`
+Answer in markdown, in a few short paragraphs; no headings. You cannot change the review or the code: I decide what to do. I may then ask more; answer what I ask, briefly.
+
+After your first explanation, call assess_finding once with your verdict on the finding as written: holds when it is right as it stands; refined when it is right but its scope, severity, wording or fix need correcting, with a revision of only the fields that change, rewritten whole as the review would write them (the title one short sentence, the body why it matters, the suggestion the concrete change); disputed when it does not hold up. The note says why, in one sentence written to me. Call it again after a later question only if your verdict or revision changes.${output}`
 }
 
 // How an explanation starts: the finding with where the review and I stand on it, and when a session that ended is
-// carried on, what we said and my next message.
+// carried on, what we said, the verdict it gave and what I did with it, and my next message.
 export type ExplainStart = {
   finding: Finding
   summary: ReviewSummary | null
   triage: Triage | null
   prior: ReviewMessage[]
+  assessed: { verdict: Assessment['verdict']; settled: 'applied' | 'ignored' | null } | null
   text: string | null
 }
 
@@ -194,6 +206,10 @@ export function explainPrompt(input: ReviewInput, start: ExplainStart): string {
   const said = start.prior.filter(message => message.text.trim()).map(message => `${message.role === 'me' ? 'Me' : 'You'}: ${clip(message.text, 3000, false)}`)
   if (said.length > 0) {
     lines.push('', `You explained it earlier, in a session that ended. What we said:\n${said.join('\n\n')}`)
+  }
+  if (start.assessed) {
+    const settled = start.assessed.settled === 'applied' ? ' I applied your revision: the finding above is the revised one.' : start.assessed.settled === 'ignored' ? ' I left the finding as it was.' : ''
+    lines.push('', `You assessed it as ${start.assessed.verdict}.${settled} Call assess_finding again only if your verdict changes.`)
   }
   lines.push('', start.text?.trim() || 'Explain this finding.')
 
@@ -247,7 +263,6 @@ function clip(text: string, max: number, isFlat = true): string {
 // what we said. The findings keep their numbers.
 export function priorPrompt(prior: ReviewState, triage: Record<number, Triage>): string {
   const findings = prior.findings.map(finding => {
-    const where = `${finding.path}${finding.line ? `:${finding.line}` : ''}`
     const mine = triage[finding.id]
     const status = finding.withdrawn
       ? `withdrawn by you: ${finding.withdrawn}`
@@ -258,9 +273,8 @@ export function priorPrompt(prior: ReviewState, triage: Record<number, Triage>):
           : mine?.state === 'kept'
             ? 'kept by me'
             : 'open'
-    const suggestion = finding.suggestion.trim() ? `\n  Suggestion: ${clip(finding.suggestion, 800)}` : ''
 
-    return `#${finding.id} [${finding.severity}, ${finding.category}, ${status}] ${where}: ${finding.title}\n  ${clip(finding.body, 1200)}${suggestion}`
+    return findingLine(finding, status)
   })
   const said = prior.messages
     .filter(message => message.text.trim())
@@ -278,6 +292,18 @@ export function priorPrompt(prior: ReviewState, triage: Record<number, Triage>):
   }
 
   return lines.join('\n')
+}
+
+function findingLine(finding: Finding, status: string): string {
+  const where = `${finding.path}${finding.line ? `:${finding.line}` : ''}`
+  const suggestion = finding.suggestion.trim() ? `\n  Suggestion: ${clip(finding.suggestion, 800)}` : ''
+
+  return `#${finding.id} [${finding.severity}, ${finding.category}, ${status}] ${where}: ${finding.title}\n  ${clip(finding.body, 1200)}${suggestion}`
+}
+
+// Findings I revised myself since my last message, from what their explanations found.
+export function revisedPrompt(findings: Finding[]): string {
+  return `I revised ${findings.length === 1 ? 'a finding' : 'findings'} after a closer look in a side explanation; ${findings.length === 1 ? 'it now reads' : 'they now read'}:\n${findings.map(finding => findingLine(finding, 'revised by me')).join('\n')}`
 }
 
 // Asks for a second look after new commits: settle each open finding, then review what changed.
@@ -573,7 +599,28 @@ export const REVIEW_SCHEMA = strict({
   suggestions: { type: 'array', items: strict({ label: { type: 'string' }, text: { type: 'string' }, refs: { type: 'array', items: { type: 'integer' } } }) },
 })
 
+// The shape of Codex's final message in an explanation.
+export const EXPLAIN_SCHEMA = strict({
+  answer: { type: 'string' },
+  assessment: nullable(
+    strict({
+      verdict: { type: 'string', enum: ASSESSMENTS },
+      note: { type: 'string' },
+      revision: nullable(strict(Object.fromEntries(Object.entries(FINDING_SCHEMA).map(([key, schema]) => [key, key === 'line' ? schema : nullable(schema)])))),
+    }),
+  ),
+})
+
 type Nullable<T> = { [K in keyof T]: T[K] | null }
+
+export type CodexExplainTurn = { answer: string; assessment: { verdict: Assessment['verdict']; note: string; revision: Nullable<FindingFields> | null } | null }
+
+// The fields a revision changes: those given, and only for a refined finding. Codex's nulls are "stays", its line too.
+export function assessmentOf(raw: { verdict: Assessment['verdict']; note: string; revision: Partial<Nullable<FindingFields>> | null }): Assessment {
+  const changes = Object.fromEntries(Object.entries(raw.revision ?? {}).filter(([, value]) => value !== undefined && value !== null)) as Partial<FindingFields>
+
+  return { verdict: raw.verdict, note: raw.note.trim(), revision: raw.verdict === 'refined' && Object.keys(changes).length > 0 ? changes : null }
+}
 
 export type CodexTurn = {
   answer: string

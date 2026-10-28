@@ -5,8 +5,8 @@ import { join } from 'node:path'
 import type { Subprocess } from 'bun'
 
 import type { Effort } from './lib/lib'
-import { applyTurn, REVIEW_SCHEMA } from './lib/review'
-import type { CodexTurn } from './lib/review'
+import { applyTurn, assessmentOf, EXPLAIN_SCHEMA, REVIEW_SCHEMA } from './lib/review'
+import type { CodexExplainTurn, CodexTurn } from './lib/review'
 import type { EngineHooks, EngineOptions, ReviewEngine } from './review'
 
 // Codex tops out below Claude's max.
@@ -26,12 +26,12 @@ type CodexEvent = {
 export function openCodex({ config, dir, system }: EngineOptions, hooks: EngineHooks): ReviewEngine {
   const codex = Bun.which('codex')!
   const cwd = dir ?? tmpdir()
-  const { book } = hooks
-  // Codex reads the schema from a file. Without the book (an explanation), its final message is the answer as it is.
-  const schema = !book ? null : (async () => {
+  const { book, onAssess } = hooks
+  // Codex reads the schema from a file: the review's changes, or an explanation's answer and verdict.
+  const schema = (async () => {
     const folder = await mkdtemp(join(tmpdir(), 'prs-review-schema-'))
     const path = join(folder, 'schema.json')
-    await Bun.write(path, JSON.stringify(REVIEW_SCHEMA))
+    await Bun.write(path, JSON.stringify(book ? REVIEW_SCHEMA : EXPLAIN_SCHEMA))
 
     return { folder, path }
   })()
@@ -45,7 +45,7 @@ export function openCodex({ config, dir, system }: EngineOptions, hooks: EngineH
   const turn = async (prompt: string) => {
     const shared = [
       '--json', '--ignore-user-config', '--ignore-rules', '--skip-git-repo-check',
-      ...(schema ? ['--output-schema', (await schema).path] : []),
+      '--output-schema', (await schema).path,
       '-c', 'sandbox_mode="read-only"',
       // Nothing that reaches out: the sandbox has no network, and these would get around it.
       '-c', 'web_search="disabled"',
@@ -97,13 +97,16 @@ export function openCodex({ config, dir, system }: EngineOptions, hooks: EngineH
       hooks.onDone(null, true)
       return
     }
-    const parsed = book ? parseTurn(last) : last.trim() ? { answer: last } : null
+    const parsed = book ? parseTurn(last) : parseExplainTurn(last)
     if (!parsed) {
       const stderr = (await new Response(proc.stderr).text()).trim().split('\n').pop()
       hooks.onDone(`The model did not answer (${failure || (last ? 'its answer was not the expected JSON' : stderr || `codex exited with ${exitCode}`)})`, false)
       return
     }
     unapplied = book && 'new_findings' in parsed ? applyTurn(book, parsed) : []
+    if (onAssess && 'assessment' in parsed && parsed.assessment) {
+      onAssess(assessmentOf(parsed.assessment))
+    }
     if (parsed.answer.trim()) {
       hooks.onText(parsed.answer.trim(), true)
     }
@@ -123,7 +126,7 @@ export function openCodex({ config, dir, system }: EngineOptions, hooks: EngineH
     close: () => {
       isClosed = true
       child?.kill()
-      void schema?.then(({ folder }) => rm(folder, { recursive: true, force: true }))
+      void schema.then(({ folder }) => rm(folder, { recursive: true, force: true }))
     },
   }
 }
@@ -140,6 +143,15 @@ function parseTurn(text: string): CodexTurn | null {
   try {
     const value = JSON.parse(text) as CodexTurn
     return Array.isArray(value.new_findings) && typeof value.answer === 'string' ? value : null
+  } catch {
+    return null
+  }
+}
+
+function parseExplainTurn(text: string): CodexExplainTurn | null {
+  try {
+    const value = JSON.parse(text) as CodexExplainTurn
+    return typeof value.answer === 'string' ? { answer: value.answer, assessment: value.assessment ?? null } : null
   } catch {
     return null
   }

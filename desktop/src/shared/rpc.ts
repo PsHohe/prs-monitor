@@ -1,6 +1,6 @@
 import type { Done } from '../../../src/github'
 import type { Conversation, Effort, ReportProvider, ThreadDetail } from '../../../src/lib/lib'
-import type { ExplainStart, ReviewDraft, ReviewStart, ReviewState, Triage } from '../../../src/lib/review'
+import type { ExplainStart, FindingFields, ReviewDraft, ReviewStart, ReviewState, Triage } from '../../../src/lib/review'
 import type { ExplainState } from '../../../src/review'
 import type { Snapshot } from '../../../src/monitor'
 import type { PrRow } from '../../../src/types'
@@ -61,6 +61,8 @@ export type PrsRpc = {
       // still answers.
       sendExplain: { params: { pr: PrRow; start: ExplainStart & { text: string } }; response: boolean }
       stopExplain: { params: { key: string; findingId: number }; response: boolean }
+      // My revision of a finding from its explanation, for the open review session to keep and tell the model.
+      reviseFinding: { params: { key: string; findingId: number; changes: Partial<FindingFields> }; response: boolean }
       // A double click on the app's top bar, which stands in for the title bar.
       titleBarDoubleClick: { params: {}; response: boolean }
       // Restarts into the downloaded update.
@@ -96,7 +98,9 @@ export type ReviewUpdate = ReviewState & { key: string; model: string }
 // The explanation of one finding of the review for the PR with this row key.
 export type ExplainUpdate = ExplainState & { key: string; findingId: number; model: string }
 
-export type ExplainThread = ExplainState & { model: string }
+// settled is what I did with the verdict given at that message: applied its revision (before is what the fields were,
+// to undo it) or ignored it. One for an earlier verdict no longer counts.
+export type ExplainThread = ExplainState & { model: string; settled: { at: number; state: 'applied' | 'ignored'; before: Partial<FindingFields> | null } | null }
 
 // A review as the app keeps it. stamp is what the PR looked like when the review started, so a later change shows
 // it is out of date. triage and selected are mine: what I decided about each finding, and those attached to my next

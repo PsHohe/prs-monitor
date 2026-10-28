@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 
 import { mergeConfig } from '../src/lib/lib'
-import { applyTurn, commentableLines, DIFF_LIMIT, explainPrompt, explainSystem, findingText, REVIEW_SCHEMA, reviewBook, describeTool, followUpPrompt, isReadOnlyCommand, priorPrompt, rereviewPrompt, reviewPayload, reviewPrompt, reviewSystem } from '../src/lib/review'
+import { applyTurn, assessmentOf, commentableLines, DIFF_LIMIT, explainPrompt, explainSystem, EXPLAIN_SCHEMA, findingText, REVIEW_SCHEMA, reviewBook, describeTool, followUpPrompt, isReadOnlyCommand, priorPrompt, rereviewPrompt, revisedPrompt, reviewPayload, reviewPrompt, reviewSystem } from '../src/lib/review'
 import type { CodexTurn, Finding, ReviewDraft, ReviewInput, ReviewState } from '../src/lib/review'
 
 const INPUT: ReviewInput = {
@@ -342,7 +342,7 @@ test('an explanation is told it reads the code but cannot change the review', ()
 test('the explanation prompt carries the PR, the finding and where I stand on it', () => {
   const one = { ...finding(3, 'The retry never stops'), body: 'It loops forever.', suggestion: 'Cap it at 3.' }
   const summary = { verdict: 'request_changes' as const, overview: 'Adds a retry.', risks: [], notChecked: [] }
-  const prompt = explainPrompt(INPUT, { finding: one, summary, triage: { state: 'dismissed', reason: 'tested by hand' }, prior: [], text: null })
+  const prompt = explainPrompt(INPUT, { finding: one, summary, triage: { state: 'dismissed', reason: 'tested by hand' }, prior: [], assessed: null, text: null })
   expect(prompt).toContain('+retry()')
   expect(prompt).toContain('#3 (medium severity, bug, high confidence) at src/sync.ts:10: The retry never stops')
   expect(prompt).toContain('Suggested fix:\nCap it at 3.')
@@ -358,11 +358,33 @@ test('an explanation carried on from an ended session hears what we said, then m
     summary: null,
     triage: null,
     prior: [said('ai', 'It leaks the handle.'), said('me', ''), said('me', 'Where?')],
+    assessed: { verdict: 'refined', settled: 'applied' },
     text: 'And on retry?',
   })
   expect(prompt).toContain('What we said:\nYou: It leaks the handle.\n\nMe: Where?')
   expect(prompt).toContain('I have not decided on it yet.')
+  expect(prompt).toContain('You assessed it as refined. I applied your revision')
   expect(prompt).toEndWith('And on retry?')
+})
+
+test('the explanation gives its verdict with assess_finding, or in its JSON on Codex', () => {
+  expect(explainSystem(true)).toContain('call assess_finding once')
+  expect(explainSystem(true)).not.toContain('final message')
+  expect(explainSystem(true, 'codex')).toContain('final message')
+  expect(Object.keys(EXPLAIN_SCHEMA.properties)).toEqual(['answer', 'assessment'])
+})
+
+test('a verdict keeps only the fields a refined finding changes', () => {
+  const revision = { severity: 'low' as const, category: null, path: null, line: null, title: 'Narrower', body: null, suggestion: null, confidence: null }
+  expect(assessmentOf({ verdict: 'refined', note: ' Overstated. ', revision })).toEqual({ verdict: 'refined', note: 'Overstated.', revision: { severity: 'low', title: 'Narrower' } })
+  expect(assessmentOf({ verdict: 'disputed', note: 'Wrong.', revision })).toEqual({ verdict: 'disputed', note: 'Wrong.', revision: null })
+  expect(assessmentOf({ verdict: 'refined', note: 'Same.', revision: { title: null } }).revision).toBeNull()
+})
+
+test('the review hears of findings I revised from their explanations', () => {
+  const prompt = revisedPrompt([{ ...finding(2, 'Narrower'), body: 'Only one note.' }])
+  expect(prompt).toStartWith('I revised a finding after a closer look')
+  expect(prompt).toContain('#2 [medium, bug, revised by me] src/sync.ts:10: Narrower\n  Only one note.')
 })
 
 test('a copied finding carries where it is, what it says and the fix', () => {

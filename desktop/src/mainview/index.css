@@ -1941,3 +1941,68 @@ kbd {
 .finding.explained {
   box-shadow: 0 0 0 1px var(--accent);
 }
+
+/* What an explanation found about its finding: a label on the cards, and what to do about it in the panel. */
+.verdict {
+  padding: 0 7px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid currentColor;
+}
+
+.verdict.holds {
+  color: var(--success);
+}
+
+.verdict.refined {
+  color: var(--warning);
+}
+
+.verdict.disputed {
+  color: var(--error);
+}
+
+.verdict-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warning);
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.verdict-card.disputed {
+  border-left-color: var(--error);
+}
+
+.verdict-card p {
+  margin: 0;
+}
+
+.verdict-card .revision {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.verdict-card .revision .label {
+  margin-bottom: 2px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.verdict-card .revision .md {
+  margin: 0;
+}
+
+.verdict-card .actions button:not(.link) {
+  padding: 3px 12px;
+  font-size: 13px;
+}

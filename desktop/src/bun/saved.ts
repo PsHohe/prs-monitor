@@ -48,7 +48,14 @@ function settled(review: SavedReview): SavedReview {
     explains: Object.fromEntries(
       Object.entries(review.explains ?? {}).map(([id, thread]) => [
         id,
-        { ...thread, isBusy: false, activity: null, failure: thread.isBusy ? 'The answer stopped when the app quit' : thread.failure },
+        {
+          ...thread,
+          assessment: thread.assessment ?? null,
+          settled: thread.settled ?? null,
+          isBusy: false,
+          activity: null,
+          failure: thread.isBusy ? 'The answer stopped when the app quit' : thread.failure,
+        },
       ]),
     ),
     failure: review.isBusy ? (review.turn === 0 ? 'The review stopped when the app quit' : 'The answer stopped when the app quit') : review.failure,
