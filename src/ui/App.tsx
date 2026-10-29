@@ -35,6 +35,7 @@ import {
   ciChip,
   detailOf,
   extraChips,
+  MERGE_WORDS,
   REPORT_PROVIDERS,
   reportModelLabel,
   rerequestable,
@@ -67,7 +68,6 @@ const COLORS: Record<NonNullable<Chip['color']>, string> = { error: 'red', warni
 const CLAUDE_MODELS = ['sonnet', 'opus', 'haiku', 'fable']
 const HOME_CONFIG_SHOWN = HOME_CONFIG.replace(homedir(), '~')
 const PROVIDER_NAMES = { claude: 'Claude', codex: 'Codex' } as const
-const MERGE_WORDS = { merge: 'a merge commit', squash: 'squash', rebase: 'rebase' } as const
 // What a PR key does, in the order the actions line shows them; `change` keys touch GitHub or git.
 type KeyGroup = 'copy' | 'view' | 'change' | 'mark'
 const KEY_GROUPS: KeyGroup[] = ['copy', 'view', 'change', 'mark']

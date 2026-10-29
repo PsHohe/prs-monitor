@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 
-import { ago, detailOf } from '../../../src/lib/lib'
+import type { Done } from '../../../src/github'
+import { ago, detailOf, MERGE_WORDS } from '../../../src/lib/lib'
+import type { Config } from '../../../src/lib/lib'
 import { isOpenFinding } from '../../../src/lib/review'
 import type { PrRow } from '../../../src/types'
 import { reasonsOf } from '../shared/attention'
@@ -10,6 +12,7 @@ import { startAddress, useAddress } from './addresses'
 import { bun } from './bridge'
 import { Avatar, Chips } from './Chips'
 import { Timeline } from './Conversation'
+import { Dialog } from './Dialog'
 import { ExplainPanel } from './Explain'
 import { Files } from './Files'
 import { useRemote } from './remote'
@@ -54,11 +57,36 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
   const address = useAddress(pr)
   const explained = useExplaining(pr)
   const isExplaining = explained !== null && !!review?.explains[explained]
+  // The method asked about while the merge dialog is open, and how the merge went.
+  const [mergeAsk, setMergeAsk] = useState<Config['mergeMethod'] | null>(null)
+  const [merged, setMerged] = useState<Done | 'busy' | null>(null)
+  const [mergeFailure, setMergeFailure] = useState<string | null>(null)
+  const canMerge = pr.canMerge && !isGone && merged === null
   const toTriage = review ? review.findings.filter(finding => isOpenFinding(finding) && !review.triage[finding.id]).length : 0
 
   const reply = () => {
     setTab('threads')
     setFocusSignal(n => n + 1)
+  }
+
+  const askMerge = async () => {
+    const method = await bun.mergeMethod({ pr }).catch(() => null)
+    if (method) {
+      setMergeAsk(method)
+    }
+  }
+  const merge = async () => {
+    const method = mergeAsk
+    setMergeAsk(null)
+    if (!method) {
+      return
+    }
+    setMerged('busy')
+    setMergeFailure(null)
+    // The list refreshes on its own once GitHub took it; a failure lets me try again.
+    const result = await bun.merge({ pr, method }).catch((err: unknown): Done => ({ ok: false, text: err instanceof Error ? err.message : String(err) }))
+    setMerged(result.ok ? result : null)
+    setMergeFailure(result.ok ? null : result.text)
   }
 
   // Opens the threads with the AI's drafts for those waiting on me, asking for them the first time.
@@ -96,6 +124,8 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
         openAddress()
       } else if (event.key === 'r' && owed > 0) {
         reply()
+      } else if (event.key === 'm' && canMerge && !(isExplaining && actionsWidth === null)) {
+        void askMerge()
       } else {
         return
       }
@@ -164,7 +194,16 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
                 <p>{detailOf(pr, now)}</p>
               )}
             </div>
-            {actionsWidth !== null ? null : owed > 0 ? (
+            {actionsWidth !== null ? null : canMerge ? (
+              <>
+                <button onClick={() => bun.openUrl({ url: pr.url })} title="o">
+                  Open on GitHub
+                </button>
+                <button className="primary" onClick={askMerge} title="m">
+                  Merge
+                </button>
+              </>
+            ) : owed > 0 ? (
               <>
                 <button onClick={() => bun.openUrl({ url: pr.url })} title="o">
                   Open on GitHub
@@ -179,6 +218,9 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
               </button>
             )}
           </section>
+          {merged === 'busy' && <p className="notice muted">Merging…</p>}
+          {merged !== null && merged !== 'busy' && <p className="notice success">{merged.text}</p>}
+          {mergeFailure && <p className="notice error">Could not merge: {mergeFailure}</p>}
 
           {isAiOn && <ReportCard pr={pr} now={now} isAuto={isAutoReport} />}
 
@@ -242,10 +284,19 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
         <>
           <Splitter width={actionsWidth} min={ACTIONS.min} max={actionsMax} side="right" label="Resize the actions" onWidth={onActionsWidth} />
           <aside className="pane actions-pane" style={{ width: actionsWidth }}>
-            <Actions pr={pr} isAiOn={isAiOn} onReply={reply} onAddress={openAddress} onReview={openReview} />
+            <Actions pr={pr} isAiOn={isAiOn} onReply={reply} onAddress={openAddress} onReview={openReview} onMerge={canMerge ? askMerge : null} />
           </aside>
         </>
         )
+      )}
+      {mergeAsk && (
+        <Dialog
+          title={`Merge #${pr.number} into ${pr.baseRef} with ${MERGE_WORDS[mergeAsk]}?`}
+          body="It merges on GitHub for everyone. The method is merge_method in the repo's config."
+          confirm="Merge"
+          onConfirm={merge}
+          onCancel={() => setMergeAsk(null)}
+        />
       )}
     </>
   )

@@ -25,6 +25,7 @@ const BASE: PrRow = {
   isFlakyOnly: false,
   hasConflicts: false,
   isBehind: false,
+  canMerge: false,
   unresolved: 0,
   replies: [],
   isRequestedFromMe: false,

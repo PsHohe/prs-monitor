@@ -5,7 +5,7 @@ import Electrobun, { ApplicationMenu, BrowserView, BrowserWindow, Tray, Updater,
 
 import { codexModels, quickReport } from '../../../src/ai'
 import { copy } from '../../../src/actions'
-import { fetchConversation, fetchThreads, gh, postReview, readState, replyToThread, resolveThread, updateState } from '../../../src/github'
+import { fetchConversation, fetchThreads, gh, mergePr, postReview, readState, replyToThread, resolveThread, updateState } from '../../../src/github'
 import { compileRegex, REPORT_PROVIDERS, reportModelLabel, rowKey, threadPages } from '../../../src/lib/lib'
 import type { Config, ReportProvider } from '../../../src/lib/lib'
 import { reviewPayload } from '../../../src/lib/review'
@@ -425,6 +425,8 @@ const rpc = BrowserView.defineRPC<{ bun: RPCSchema<PrsRpc['bun']>; webview: RPCS
       diff: ({ pr }) => diff(pr),
       reply: ({ threadId, body }) => reloadAfter(replyToThread(threadId, body)),
       resolve: ({ threadId }) => reloadAfter(resolveThread(threadId)),
+      mergeMethod: async ({ pr }) => (latest ? configFor(latest.configs, pr.repo) : await loadConfig(null)).mergeMethod,
+      merge: ({ pr, method }) => reloadAfter(mergePr(pr, method)),
       repos: () => readDesktopState(),
       addRepo: () => addRepo(),
       removeRepo: ({ repo }) => changeRepos(state => withoutRepo(state, repo)),

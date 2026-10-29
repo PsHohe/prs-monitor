@@ -28,6 +28,8 @@ export type PrRow = {
   isFlakyOnly: boolean
   hasConflicts: boolean
   isBehind: boolean
+  // GitHub would merge it now: open, not a draft, nothing required missing. Anyone's PR, unlike the ready bucket.
+  canMerge: boolean
   unresolved: number | null
   // Unresolved review threads waiting for my reply; null when their details were not loaded.
   replies: ThreadSummary[] | null

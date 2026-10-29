@@ -1,6 +1,6 @@
 import type { Done } from '../../../src/github'
 import type { AddressState } from '../../../src/lib/address'
-import type { Conversation, Effort, ReportProvider, ThreadDetail } from '../../../src/lib/lib'
+import type { Config, Conversation, Effort, ReportProvider, ThreadDetail } from '../../../src/lib/lib'
 import type { ExplainStart, FindingFields, ReviewDraft, ReviewStart, ReviewState, Triage } from '../../../src/lib/review'
 import type { ExplainState } from '../../../src/review'
 import type { Snapshot } from '../../../src/monitor'
@@ -25,6 +25,9 @@ export type PrsRpc = {
       diff: { params: { pr: PrRow }; response: { text: string } | { failure: string } }
       reply: { params: { threadId: string; body: string }; response: Done }
       resolve: { params: { threadId: string }; response: Done }
+      // The merge method the PR's repo config asks for, and merging with it.
+      mergeMethod: { params: { pr: PrRow }; response: Config['mergeMethod'] }
+      merge: { params: { pr: PrRow; method: Config['mergeMethod'] }; response: Done }
       repos: { params: {}; response: DesktopState }
       // Asks for a folder inside a clone; null when the picker was cancelled.
       addRepo: { params: {}; response: DesktopState | { failure: string } | null }

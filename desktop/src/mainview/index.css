@@ -669,6 +669,10 @@ button.icon:disabled {
   background: var(--success-bg);
 }
 
+.next + .notice {
+  margin: -6px 0 14px;
+}
+
 .next .label {
   font-size: 11px;
   font-weight: 600;
@@ -1623,6 +1627,14 @@ button.link {
 .action:disabled {
   color: var(--muted);
   cursor: default;
+}
+
+/* Not the filled button.primary: a primary action stands out by its label only. */
+.action.primary {
+  padding: 7px 10px;
+  border: 0;
+  background: none;
+  color: inherit;
 }
 
 .action.primary span {

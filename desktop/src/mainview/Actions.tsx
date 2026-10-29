@@ -4,10 +4,11 @@ import { bun } from './bridge'
 import { startReport, useReport } from './reports'
 import { useReview } from './reviews'
 
-type Props = { pr: PrRow; isAiOn: boolean; onReply: () => void; onAddress: () => void; onReview: () => void }
+// onMerge is null unless GitHub would merge the PR now.
+type Props = { pr: PrRow; isAiOn: boolean; onReply: () => void; onAddress: () => void; onReview: () => void; onMerge: (() => void) | null }
 
 // What can be done with the selected PR, each with its key.
-export function Actions({ pr, isAiOn, onReply, onAddress, onReview }: Props) {
+export function Actions({ pr, isAiOn, onReply, onAddress, onReview, onMerge }: Props) {
   const report = useReport(pr)
   const address = useAddress(pr)
   const review = useReview(pr)
@@ -18,6 +19,7 @@ export function Actions({ pr, isAiOn, onReply, onAddress, onReview }: Props) {
     <div className="actions-panel">
       <section className="card">
         <Action label="Open on GitHub" shortcut="o" onClick={() => bun.openUrl({ url: pr.url })} />
+        {onMerge && <Action label={`Merge into ${pr.baseRef}`} shortcut="m" isPrimary onClick={onMerge} />}
         {owed > 0 && <Action label={`Reply to ${owed} thread${owed === 1 ? '' : 's'}`} shortcut="r" isPrimary onClick={onReply} />}
       </section>
       {isAiOn && (

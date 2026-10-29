@@ -40,6 +40,9 @@ export const DEFAULT_CONFIG: Config = {
   sections: {},
 }
 
+// How each merge method reads in a question: "Merge #12 into main with squash?"
+export const MERGE_WORDS = { merge: 'a merge commit', squash: 'squash', rebase: 'rebase' } as const
+
 type ConfigFile = { values: Record<string, string>; sections: Record<string, string> }
 
 function unquote(raw: string): string {
@@ -454,6 +457,8 @@ export function toRow(
     isFlakyOnly: ci.failing.length > 0 && ci.failing.every(isFlaky),
     hasConflicts: raw.mergeable === 'CONFLICTING' || raw.mergeStateStatus === 'DIRTY',
     isBehind: raw.mergeStateStatus === 'BEHIND',
+    // UNSTABLE is only checks that are not required failing; GitHub still offers its merge button.
+    canMerge: (raw.state ?? 'OPEN') === 'OPEN' && !raw.isDraft && ['CLEAN', 'HAS_HOOKS', 'UNSTABLE'].includes(raw.mergeStateStatus ?? ''),
     unresolved,
     replies: unresolved === 0 ? [] : threads && owedReplies(threads, me, isMine, options.automated),
     isRequestedFromMe,
