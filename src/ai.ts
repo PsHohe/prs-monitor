@@ -99,6 +99,8 @@ async function completeClaude(
         cwd: tmpdir(),
         // The installed CLI, so a compiled prs works without the SDK's bundled copy.
         pathToClaudeCodeExecutable: Bun.which('claude') ?? undefined,
+        // Label the requests as ours, not as the Claude Code session prs may have been started from.
+        env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: 'prs-monitor' },
         abortController,
       },
     })

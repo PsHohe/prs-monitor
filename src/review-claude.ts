@@ -169,6 +169,7 @@ export function openClaude({ config, dir, system }: EngineOptions, hooks: Engine
       includePartialMessages: true,
       cwd: dir ?? tmpdir(),
       pathToClaudeCodeExecutable: Bun.which('claude') ?? undefined,
+      env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: 'prs-monitor' },
       abortController,
     },
   })
