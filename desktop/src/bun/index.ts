@@ -12,7 +12,7 @@ import { reviewPayload } from '../../../src/lib/review'
 import type { ExplainStart, ReviewStart, ReviewState, Triage } from '../../../src/lib/review'
 import { announcements, configFor, detectScope, HOME_CONFIG, loadConfig, loadConfigs, refresh, saveHomeSettings } from '../../../src/monitor'
 import type { Configs, Scope, Snapshot } from '../../../src/monitor'
-import { openAddress, openExplain, openReview } from '../../../src/review'
+import { openAddress, openExplain, openReview, removeLeftovers } from '../../../src/review'
 import type { AddressSession, ExplainSession, ExplainState, ReviewSession } from '../../../src/review'
 import type { PrRow } from '../../../src/types'
 import { providerFor, withoutRepo, withRepo } from '../shared/repos'
@@ -189,6 +189,12 @@ async function cloneOf(pr: PrRow): Promise<string | null> {
 
   return desktop.repos.find(one => one.repo === pr.repo)?.root ?? cli.repos[pr.repo] ?? null
 }
+
+// Checkouts left by reviews from before the app last quit, which nothing else would remove.
+void (async () => {
+  const [desktop, cli] = await Promise.all([readDesktopState(), readState()])
+  await removeLeftovers([...desktop.repos.map(one => one.root), ...Object.values(cli.repos)])
+})()
 
 async function startReview(pr: PrRow, start: ReviewStart): Promise<boolean> {
   const key = rowKey(pr)

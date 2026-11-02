@@ -44,6 +44,10 @@ export type EngineHooks = {
   onEnd: () => void
 }
 
+// How long a review or an explanation waits for my next message before it closes, giving back its checkout; that
+// message then starts a new session that carries on from where it stands.
+const IDLE_MS = 10 * 60_000
+
 // Reviews the PR with the configured provider, then keeps the session open to talk about it. Every change to the
 // review, from the first finding to the model's answers, reaches onUpdate as the whole state. With root, my clone of
 // the repo, the model reads the PR's code in a checkout of its head; without it, only the diff.
@@ -67,6 +71,7 @@ export function openReview(
   let engine: ReviewEngine | null = null
   let worktree: Worktree | null = null
   let isClosed = false
+  let idle: ReturnType<typeof setTimeout> | undefined
   // The findings I revised since my last message, which it has not heard of.
   const revised = new Set<number>()
   // Set when I stop the answer while it still catches up with new commits, before the model has my message; what
@@ -79,10 +84,19 @@ export function openReview(
     state.failure = failure
     state.activity = null
     update()
+    if (!isClosed) {
+      clearTimeout(idle)
+      idle = setTimeout(close, IDLE_MS)
+    }
   }
   const end = () => {
     isClosed = true
+    clearTimeout(idle)
     void worktree?.remove()
+  }
+  const close = () => {
+    engine?.close()
+    end()
   }
   const hooks: EngineHooks = {
     book,
@@ -179,6 +193,7 @@ export function openReview(
       if (isClosed || state.isBusy || !engine) {
         return false
       }
+      clearTimeout(idle)
       state.turn++
       isStopping = false
       state.messages.push({ role: 'me', text: text.trim(), refs, changes: [] }, { role: 'ai', text: '', refs: [], changes: [] })
@@ -223,10 +238,7 @@ export function openReview(
         update()
       }
     },
-    close: () => {
-      engine?.close()
-      end()
-    },
+    close,
   }
 }
 
@@ -273,16 +285,26 @@ export function openExplain(
   let engine: ReviewEngine | null = null
   let worktree: Worktree | null = null
   let isClosed = false
+  let idle: ReturnType<typeof setTimeout> | undefined
 
   const finish = (failure: string | null) => {
     state.isBusy = false
     state.failure = failure
     state.activity = null
     update()
+    if (!isClosed) {
+      clearTimeout(idle)
+      idle = setTimeout(close, IDLE_MS)
+    }
   }
   const end = () => {
     isClosed = true
+    clearTimeout(idle)
     void worktree?.remove()
+  }
+  const close = () => {
+    engine?.close()
+    end()
   }
   const hooks: EngineHooks = {
     book: null,
@@ -341,6 +363,7 @@ export function openExplain(
       if (isClosed || state.isBusy || !engine) {
         return false
       }
+      clearTimeout(idle)
       state.messages.push(said('me', text.trim()), said('ai', ''))
       state.isBusy = true
       state.failure = null
@@ -354,10 +377,7 @@ export function openExplain(
         engine?.stop()
       }
     },
-    close: () => {
-      engine?.close()
-      end()
-    },
+    close,
   }
 }
 
@@ -507,37 +527,80 @@ async function changesSince(repo: string, from: string, to: string, dir: string 
   return diff.exitCode === 0 ? { diff: diff.stdout, commits: count.exitCode === 0 ? Number(count.stdout.trim()) : null } : null
 }
 
-// update moves it to the PR's head as it is now.
+// update moves it to the PR's head as it is now, for every session that shares it; remove gives the session's hold
+// back, and the last one to let go removes the checkout.
 type Worktree = { dir: string; update: () => Promise<void>; remove: () => Promise<void> }
 
-// The checkouts of the reviews open in this process; any other is left from one that quit mid-review.
-const checkouts = new Set<string>()
+// The checkouts of the sessions open in this process, by clone and PR: a review, its explanations and the answers to
+// its threads share one, with how many sessions hold it.
+const shared = new Map<string, { made: Promise<Worktree | null>; holders: number }>()
+// Their folders; any other is left from a session that quit mid-review.
+const live = new Set<string>()
 
-async function removeLeftovers(root: string) {
-  const listed = await run(['git', 'worktree', 'list', '--porcelain'], root)
-  const dirs = listed.stdout
-    .split('\n')
-    .filter(line => line.startsWith('worktree '))
-    .map(line => line.slice('worktree '.length))
-    .filter(dir => basename(dir).startsWith('prs-review-') && !checkouts.has(dir))
-  await Promise.all(dirs.map(dir => run(['git', 'worktree', 'remove', '--force', dir], root)))
-  await run(['git', 'worktree', 'prune'], root)
+// Removes the checkouts in these clones that no open session holds: left by an app that quit or crashed.
+export async function removeLeftovers(roots: string[]) {
+  await Promise.all(
+    [...new Set(roots)].map(async root => {
+      const listed = await run(['git', 'worktree', 'list', '--porcelain'], root)
+      const dirs = listed.stdout
+        .split('\n')
+        .filter(line => line.startsWith('worktree '))
+        .map(line => line.slice('worktree '.length))
+        .filter(dir => basename(dir).startsWith('prs-review-') && !live.has(dir))
+      await Promise.all(dirs.map(dir => run(['git', 'worktree', 'remove', '--force', dir], root)))
+      await run(['git', 'worktree', 'prune'], root)
+    }),
+  )
 }
 
-// A detached checkout of the PR's head beside my clone, so the review reads the code without touching my working
-// tree; null when it cannot be made, and the review reads only the diff.
+// The PR's checkout for a session, made by the first session that asks and shared with the others while it is held;
+// null when it cannot be made, and the session reads only the diff. One that joins finds it where the others left it.
 async function checkout(root: string, repo: string, number: number): Promise<Worktree | null> {
+  const key = `${root}\n${repo}#${number}`
+  const held = shared.get(key) ?? { made: makeCheckout(root, repo, number), holders: 0 }
+  if (!shared.has(key)) {
+    shared.set(key, held)
+    // One that could not be made is asked for anew by the next session.
+    void held.made.then(worktree => {
+      if (!worktree && shared.get(key) === held) {
+        shared.delete(key)
+      }
+    })
+  }
+  held.holders++
+  const worktree = await held.made
+  if (!worktree) {
+    return null
+  }
+  let isHeld = true
+  const remove = async () => {
+    if (!isHeld) {
+      return
+    }
+    isHeld = false
+    held.holders--
+    if (held.holders === 0) {
+      shared.delete(key)
+      await worktree.remove()
+    }
+  }
+
+  return { dir: worktree.dir, update: worktree.update, remove }
+}
+
+// A detached checkout of the PR's head beside my clone, so the model reads the code without touching my working tree.
+async function makeCheckout(root: string, repo: string, number: number): Promise<Worktree | null> {
   const head = await fetchHead(root, repo, number)
   if (!head) {
     return null
   }
-  await removeLeftovers(root)
+  await removeLeftovers([root])
   const dir = await realpath(await mkdtemp(join(tmpdir(), 'prs-review-')))
+  live.add(dir)
   const added = await run(['git', 'worktree', 'add', '--detach', '--quiet', dir, head], root)
-  checkouts.add(dir)
   const remove = async () => {
     await run(['git', 'worktree', 'remove', '--force', dir], root)
-    checkouts.delete(dir)
+    live.delete(dir)
   }
   if (added.exitCode !== 0) {
     await remove()
