@@ -4,7 +4,7 @@ import { ago, rowKey } from '../../../src/lib/lib'
 import type { PrRow } from '../../../src/types'
 import { toHtml } from './markdown'
 import { stampOf } from './remote'
-import { cancelReport, startReport, useReport } from './reports'
+import { cancelReport, isReportCurrent, startReport, useReport } from './reports'
 
 // PRs the automatic report already started for as they looked then, so a cancel or a failure is not retried.
 const autoStarted = new Set<string>()
@@ -62,7 +62,7 @@ export function ReportCard({ pr, now, isAuto }: Props) {
             Cancel
           </button>
         ) : (
-          <button className="link" onClick={() => startReport(pr)} title="g">
+          <button className="link" onClick={() => startReport(pr)} title={isReportCurrent(report, pr) ? 'Write it again; the PR has not changed since' : 'g'}>
             {report.failure ? 'Try again' : 'Rewrite'}
           </button>
         )}

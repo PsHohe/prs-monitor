@@ -1,14 +1,23 @@
+import { tomorrowMorning } from '../../../src/lib/lib'
 import type { PrRow } from '../../../src/types'
 import { useAddress } from './addresses'
 import { bun } from './bridge'
-import { startReport, useReport } from './reports'
+import { isReportCurrent, startReport, useReport } from './reports'
 import { useReview } from './reviews'
 
-// onMerge is null unless GitHub would merge the PR now.
-type Props = { pr: PrRow; isAiOn: boolean; onReply: () => void; onAddress: () => void; onReview: () => void; onMerge: (() => void) | null }
+// onMerge is null unless GitHub would merge the PR now; onSnooze when the PR cannot be snoozed.
+type Props = {
+  pr: PrRow
+  isAiOn: boolean
+  onReply: () => void
+  onAddress: () => void
+  onReview: () => void
+  onMerge: (() => void) | null
+  onSnooze: ((until: number | null) => void) | null
+}
 
 // What can be done with the selected PR, each with its key.
-export function Actions({ pr, isAiOn, onReply, onAddress, onReview, onMerge }: Props) {
+export function Actions({ pr, isAiOn, onReply, onAddress, onReview, onMerge, onSnooze }: Props) {
   const report = useReport(pr)
   const address = useAddress(pr)
   const review = useReview(pr)
@@ -24,24 +33,41 @@ export function Actions({ pr, isAiOn, onReply, onAddress, onReview, onMerge }: P
       </section>
       {isAiOn && (
         <section className="card">
-          <Action label={isWriting ? 'Writing report…' : report ? 'Rewrite AI report' : 'Write AI report'} shortcut="g" isDisabled={isWriting} onClick={() => startReport(pr)} />
+          <Action
+            label={isWriting ? 'Writing report…' : report ? 'Rewrite AI report' : 'Write AI report'}
+            shortcut={isReportCurrent(report, pr) ? undefined : 'g'}
+            isDisabled={isWriting}
+            onClick={() => startReport(pr)}
+          />
           {owed > 0 && (
             <Action label={!address ? 'Draft answers with AI' : address.isBusy ? 'Drafting answers…' : 'Show drafted answers'} shortcut="a" onClick={onAddress} />
           )}
           <Action label={!review ? 'Start AI review' : review.isBusy && review.turn === 0 ? 'Reviewing…' : 'Show AI review'} shortcut="v" onClick={onReview} />
         </section>
       )}
+      {onSnooze && (
+        <section className="card">
+          {pr.bucket === 'snoozed' ? (
+            <Action label="Wake" shortcut="z" onClick={() => onSnooze(null)} />
+          ) : (
+            <>
+              <Action label="Snooze until new activity" shortcut="z" onClick={() => onSnooze(null)} />
+              <Action label="Snooze until tomorrow" shortcut="Z" onClick={() => onSnooze(tomorrowMorning(Date.now()))} />
+            </>
+          )}
+        </section>
+      )}
     </div>
   )
 }
 
-type ActionProps = { label: string; shortcut: string; isPrimary?: boolean; isDisabled?: boolean; onClick: () => void }
+type ActionProps = { label: string; shortcut?: string; isPrimary?: boolean; isDisabled?: boolean; onClick: () => void }
 
 function Action({ label, shortcut, isPrimary = false, isDisabled = false, onClick }: ActionProps) {
   return (
     <button className={`action ${isPrimary ? 'primary' : ''}`} disabled={isDisabled} onClick={onClick}>
       <span>{label}</span>
-      <kbd>{shortcut}</kbd>
+      {shortcut && <kbd>{shortcut}</kbd>}
     </button>
   )
 }

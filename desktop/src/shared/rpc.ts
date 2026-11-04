@@ -13,6 +13,11 @@ export type PrsRpc = {
     requests: {
       // force always asks GitHub; otherwise a cache under a minute old is used.
       refresh: { params: { force: boolean }; response: Snapshot }
+      // Marks and snoozes are saved where the CLI reads them too; each answers with the list as it leaves it, without asking GitHub.
+      markSeen: { params: { pr: PrRow }; response: Snapshot }
+      // until is when it comes back at the latest; new activity always brings it back.
+      snooze: { params: { pr: PrRow; until: number | null }; response: Snapshot }
+      wake: { params: { pr: PrRow }; response: Snapshot }
       openUrl: { params: { url: string }; response: boolean }
       // Puts the text on the clipboard; false when that failed.
       copy: { params: { text: string }; response: boolean }

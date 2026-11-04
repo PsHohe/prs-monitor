@@ -38,6 +38,7 @@ export function ReviewPanel({ pr, now }: Props) {
   const review = useReview(pr)
   const explained = useExplaining(pr)
   const [isShowingAside, setIsShowingAside] = useState(false)
+  const [isConfirmingRestart, setIsConfirmingRestart] = useState(false)
   // What Check for new commits found, for the PR and the turn it was about; null while it checks.
   const [checked, setChecked] = useState<{ key: string; turn: number; text: string | null } | null>(null)
 
@@ -79,6 +80,8 @@ export function ReviewPanel({ pr, now }: Props) {
   const aside = review.findings.filter(isAside)
   const kept = open.filter(finding => review.triage[finding.id]?.state === 'kept').length
   const addressed = aside.filter(finding => !!finding.addressed).length
+  // What starting over would lose that a new review cannot give back.
+  const hasMyWork = Object.keys(review.triage).length > 0 || review.messages.length > 0 || Object.keys(review.explains).length > 0 || !!review.draft
 
   return (
     <div className="review">
@@ -107,7 +110,7 @@ export function ReviewPanel({ pr, now }: Props) {
                   {checked?.key === key && checked.text === null ? 'Checking…' : 'Check for new commits'}
                 </button>
               )}
-              <button className="link" onClick={() => startReview(pr)} title="Start over; this clears the conversation and your triage">
+              <button className="link" onClick={() => (hasMyWork ? setIsConfirmingRestart(true) : startReview(pr))} title="Start over with a new review">
                 {review.failure && !canTalk ? 'Try again' : 'Review again'}
               </button>
             </>
@@ -159,6 +162,18 @@ export function ReviewPanel({ pr, now }: Props) {
       {review.messages.length > 0 && <Conversation messages={review.messages} isBusy={review.isBusy} activity={review.activity} />}
       {review.draft && <DraftCard key={review.draft.revision} pr={pr} review={review} draft={review.draft} />}
       {canTalk && <Composer pr={pr} review={review} open={open.map(finding => finding.id)} />}
+      {isConfirmingRestart && (
+        <Dialog
+          title="Start the review over?"
+          body="This clears your triage, the conversation, the explanations and any draft, and runs a new review."
+          confirm="Review again"
+          onConfirm={() => {
+            setIsConfirmingRestart(false)
+            startReview(pr)
+          }}
+          onCancel={() => setIsConfirmingRestart(false)}
+        />
+      )}
     </div>
   )
 }

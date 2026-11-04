@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { MouseEvent } from 'react'
 import { createRoot } from 'react-dom/client'
 
-import { ago, rowKey } from '../../../src/lib/lib'
+import { ago, rowKey, tomorrowMorning } from '../../../src/lib/lib'
 import type { Snapshot } from '../../../src/monitor'
 import type { PrBucket, PrRow } from '../../../src/types'
 import { bun, pushed } from './bridge'
@@ -11,6 +11,7 @@ import { SettingsSheet } from './Settings'
 import { List, SECTIONS } from './List'
 import { RepoPicker } from './RepoPicker'
 import { useExplaining } from './reviews'
+import { useMarkSeen } from './seen'
 import { Splitter } from './Splitter'
 import { fitLayout, LIST } from '../shared/layout'
 import type { Layout } from '../shared/layout'
@@ -80,6 +81,8 @@ function App() {
   const [isLoading, setIsLoading] = useState(true)
   const [failure, setFailure] = useState<string | null>(null)
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
+  // The last PR I chose myself; the one selected on its own at launch does not count as read.
+  const [pickedKey, setPickedKey] = useState<string | null>(null)
   const [isDetailOpen, setIsDetailOpen] = useState(false)
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
   const [repos, setRepos] = useState<DesktopState>({ repos: [], active: null, autoReport: false, providers: [], keepInTray: null })
@@ -132,11 +135,12 @@ function App() {
     if (!snapshot) {
       return
     }
+    const awake = rows.filter(pr => pr.bucket !== 'snoozed')
     const byRepo: Record<string, number> = {}
-    for (const pr of rows) {
+    for (const pr of awake) {
       byRepo[pr.repo] = (byRepo[pr.repo] ?? 0) + 1
     }
-    setCounts(before => (repos.active ? { ...before, [repos.active]: rows.length } : { ...Object.fromEntries(repos.repos.map(one => [one.repo, 0])), ...byRepo }))
+    setCounts(before => (repos.active ? { ...before, [repos.active]: awake.length } : { ...Object.fromEntries(repos.repos.map(one => [one.repo, 0])), ...byRepo }))
   }, [snapshot])
   // In the order shown, skipping folded groups, for the keyboard.
   const visible = SECTIONS.flatMap(({ bucket }) => (folded.includes(bucket) ? [] : rows.filter(pr => pr.bucket === bucket)))
@@ -148,6 +152,8 @@ function App() {
   const selected = found ?? (kept && rowKey(kept) === selectedKey ? kept : null)
   // The finding explained beside the selected PR, which takes the actions' place.
   const explained = useExplaining(selected)
+  // A snooze only holds on an open PR, and one that left the list has nothing to come back to.
+  const snoozable = found?.state === 'OPEN' ? found : null
 
   // On a wide window the detail pane is never empty while there is something to show.
   useEffect(() => {
@@ -156,9 +162,29 @@ function App() {
     }
   }, [isNarrow, selectedKey, visible[0]])
 
-  const select = (pr: PrRow) => {
+  const pick = (pr: PrRow) => {
     setSelectedKey(rowKey(pr))
+    setPickedKey(rowKey(pr))
+  }
+  const select = (pr: PrRow) => {
+    pick(pr)
     setIsDetailOpen(true)
+  }
+  // Puts a PR to sleep and moves on to the next one, or wakes it if it is asleep.
+  const snooze = (pr: PrRow, until: number | null) => {
+    const isAwake = pr.bucket !== 'snoozed'
+    if (isAwake) {
+      const awake = visible.filter(one => one.bucket !== 'snoozed')
+      const at = awake.findIndex(one => rowKey(one) === rowKey(pr))
+      const next = awake[at + 1] ?? awake[at - 1]
+      if (next) {
+        pick(next)
+      }
+      setIsDetailOpen(false)
+    }
+    void (isAwake ? bun.snooze({ pr, until }) : bun.wake({ pr })).then(setSnapshot, (err: unknown) =>
+      setRepoFailure(`Could not ${isAwake ? 'snooze' : 'wake'} #${pr.number}: ${err instanceof Error ? err.message : String(err)}`),
+    )
   }
   const showRepos = (next: DesktopState) => {
     const isSwitch = next.active !== repos.active
@@ -211,7 +237,7 @@ function App() {
       const step = (by: number) => {
         const next = visible[Math.max(0, Math.min(visible.length - 1, at + by))]
         if (next) {
-          setSelectedKey(rowKey(next))
+          pick(next)
         }
         event.preventDefault()
       }
@@ -227,6 +253,10 @@ function App() {
         void bun.openUrl({ url: selected.url })
       } else if (event.key === 'u' && !isLoading) {
         void load(true)
+      } else if (event.key === 'z' && snoozable) {
+        snooze(snoozable, null)
+      } else if (event.key === 'Z' && snoozable && snoozable.bucket !== 'snoozed') {
+        snooze(snoozable, tomorrowMorning(Date.now()))
       } else if (event.key === '[' && !isNarrow) {
         changeLayout({ isListOpen: !layout.isListOpen })
       } else if (event.key === ']' && !isNarrow) {
@@ -247,6 +277,7 @@ function App() {
   const showsDetail = !!selected && (!isNarrow || isDetailOpen)
   const fitted = fitLayout(windowWidth, layout, explained !== null)
   const showsList = isNarrow ? !showsDetail : fitted.list !== null
+  useMarkSeen(found, showsDetail && selectedKey === pickedKey, setSnapshot)
 
   const checked = snapshot?.checkedAt ? ago(new Date(snapshot.checkedAt).toISOString(), now) : ''
   const listPane = (
@@ -355,6 +386,7 @@ function App() {
             onExplainWidth={explainWidth => changeLayout({ explainWidth })}
             onBack={isNarrow ? () => setIsDetailOpen(false) : null}
             onChanged={() => load(true)}
+            onSnooze={snoozable ? until => snooze(snoozable, until) : null}
           />
         ) : (
           <div className="empty">

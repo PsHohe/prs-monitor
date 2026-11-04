@@ -9,6 +9,7 @@ export const SECTIONS: { bucket: PrBucket; title: string; isRich: boolean }[] = 
   { bucket: 'me', title: 'Waiting on me', isRich: true },
   { bucket: 'ready', title: 'Ready to merge', isRich: true },
   { bucket: 'others', title: 'Waiting on others', isRich: false },
+  { bucket: 'snoozed', title: 'Snoozed', isRich: false },
 ]
 
 type Props = {
@@ -74,7 +75,7 @@ function RichRow({ pr, now, showRepo, isSelected, onSelect }: RowProps) {
       <Avatar login={pr.author} size={28} />
       <span className="body">
         <span className="line">
-          {pr.isNew && <span className="unread" title="New activity" />}
+          {pr.isNew && !isSelected && <span className="unread" title="New activity" />}
           <span className="title">{pr.title}</span>
           {waited && (
             <span className={`age ${staleness(pr, now) ?? ''}`} title="Waiting on you for">
@@ -104,7 +105,7 @@ function CompactRow({ pr, showRepo, isSelected, onSelect }: RowProps) {
   return (
     <button ref={ref} className={`row compact ${isSelected ? 'selected' : ''}`} onClick={onSelect} role="option" aria-selected={isSelected}>
       <span className="line">
-        {pr.isNew && <span className="unread" title="New activity" />}
+        {pr.isNew && !isSelected && <span className="unread" title="New activity" />}
         <span className="title">{pr.title}</span>
         <span className="meta">#{pr.number}</span>
       </span>

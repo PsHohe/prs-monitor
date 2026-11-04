@@ -34,6 +34,9 @@ export function useReport(pr: PrRow): Report | null {
   return useSyncExternalStore(subscribe, () => reports.get(key) ?? null)
 }
 
+// A finished report of the PR as it is now, so writing it again would tell nothing new.
+export const isReportCurrent = (report: Report | null, pr: PrRow): boolean => !!report && report.isDone && !report.failure && report.stamp === stampOf(pr)
+
 export function startReport(pr: PrRow): void {
   reports.set(rowKey(pr), { stamp: stampOf(pr), at: new Date().toISOString(), text: '', model: '', isDone: false, failure: null })
   changed()

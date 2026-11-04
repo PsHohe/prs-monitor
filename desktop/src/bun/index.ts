@@ -58,7 +58,22 @@ async function load(maxAgeMs: number): Promise<Snapshot> {
   }
   announce(started, snapshot)
 
-  return { ...snapshot, rows: snapshot.rows.filter(pr => pr.bucket !== 'snoozed') }
+  return snapshot
+}
+
+let marking: Promise<unknown> = Promise.resolve()
+
+// Saves a mark of my own and answers with the list as it leaves it, from what was last fetched. One at a time: each
+// reads the state file and writes it back, and snoozing a PR I was reading also marks it as seen, so two at once could lose one.
+function mark(patch: Parameters<typeof updateState>[0]): Promise<Snapshot> {
+  const done = marking.then(async () => {
+    await updateState(patch)
+
+    return load(Number.POSITIVE_INFINITY)
+  })
+  marking = done.catch(() => {})
+
+  return done
 }
 
 // The last refresh's result, to notify only about what changed since; the first load and a repo switch stay quiet.
@@ -422,6 +437,9 @@ const rpc = BrowserView.defineRPC<{ bun: RPCSchema<PrsRpc['bun']>; webview: RPCS
   handlers: {
     requests: {
       refresh: ({ force }) => load(force ? 0 : 60 * 1000),
+      markSeen: ({ pr }) => mark({ seen: pr.lastOtherAt ? { [rowKey(pr)]: pr.lastOtherAt } : {} }),
+      snooze: ({ pr, until }) => mark({ snoozed: { [rowKey(pr)]: { lastOtherAt: pr.lastOtherAt, until } } }),
+      wake: ({ pr }) => mark({ snoozed: { [rowKey(pr)]: null } }),
       openUrl: ({ url }) => Utils.openExternal(url),
       copy: ({ text }) => copy(text),
       image: ({ url }) => fetchImage(url),

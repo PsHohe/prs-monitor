@@ -18,7 +18,7 @@ import { Files } from './Files'
 import { useRemote } from './remote'
 import { Splitter } from './Splitter'
 import { ReportCard } from './Report'
-import { startReport, useReport } from './reports'
+import { isReportCurrent, startReport, useReport } from './reports'
 import { ReviewPanel } from './Review'
 import { startReview, useExplaining, useReview } from './reviews'
 import { Threads } from './Threads'
@@ -39,9 +39,11 @@ type Props = {
   onExplainWidth: (width: number) => void
   onBack: (() => void) | null
   onChanged: () => void
+  // Puts the PR to sleep, or wakes it if it is asleep; null when it cannot be snoozed.
+  onSnooze: ((until: number | null) => void) | null
 }
 
-export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, actionsMax, onActionsWidth, onExplainWidth, onBack, onChanged }: Props) {
+export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, actionsMax, onActionsWidth, onExplainWidth, onBack, onChanged, onSnooze }: Props) {
   const owed = pr.replies?.length ?? 0
   // A PR that waits on my replies opens where I can give them.
   const [tab, setTab] = useState<Tab>(owed > 0 ? 'threads' : 'conversation')
@@ -116,10 +118,18 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
         setTab('conversation')
       } else if (event.key === 'f') {
         setTab('files')
-      } else if (event.key === 'g' && isAiOn && !(report && !report.isDone)) {
-        startReport(pr)
+      } else if (event.key === 'g' && isAiOn) {
+        // A stray key spends nothing on a report that is still right; the Rewrite button does it on purpose.
+        if ((!report || report.isDone) && !isReportCurrent(report, pr)) {
+          startReport(pr)
+        }
       } else if (event.key === 'v' && isAiOn) {
-        openReview()
+        // Opens the tab, as clicking it does; only a press from there starts a review, so a stray key spends nothing.
+        if (tab === 'review' && !review) {
+          startReview(pr)
+        } else {
+          setTab('review')
+        }
       } else if (event.key === 'a' && isAiOn && owed > 0) {
         openAddress()
       } else if (event.key === 'r' && owed > 0) {
@@ -179,11 +189,11 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
             <Chips pr={pr} />
           </header>
 
-          {isGone && <p className="banner">This PR is no longer in your list (merged, closed or snoozed). Showing it as it was.</p>}
+          {isGone && <p className="banner">This PR is no longer in your list (merged or closed). Showing it as it was.</p>}
 
           <section className={`next ${pr.bucket}`}>
             <div>
-              <div className="label">{reasons.length > 0 ? (pr.bucket === 'ready' ? 'Ready' : 'Waiting on you') : 'Nothing needed from you'}</div>
+              <div className="label">{pr.bucket === 'snoozed' ? 'Snoozed' : reasons.length > 0 ? (pr.bucket === 'ready' ? 'Ready' : 'Waiting on you') : 'Nothing needed from you'}</div>
               {reasons.length > 0 ? (
                 <ul>
                   {reasons.map(reason => (
@@ -191,9 +201,14 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
                   ))}
                 </ul>
               ) : (
-                <p>{detailOf(pr, now)}</p>
+                <p>{pr.bucket === 'snoozed' ? 'Comes back on new activity, or at 9:00 if you snoozed it until tomorrow.' : detailOf(pr, now)}</p>
               )}
             </div>
+            {actionsWidth === null && onSnooze && (
+              <button onClick={() => onSnooze(null)} title="z">
+                {pr.bucket === 'snoozed' ? 'Wake' : 'Snooze'}
+              </button>
+            )}
             {actionsWidth !== null ? null : canMerge ? (
               <>
                 <button onClick={() => bun.openUrl({ url: pr.url })} title="o">
@@ -284,7 +299,7 @@ export function Detail({ pr, isGone, now, isAiOn, isAutoReport, actionsWidth, ac
         <>
           <Splitter width={actionsWidth} min={ACTIONS.min} max={actionsMax} side="right" label="Resize the actions" onWidth={onActionsWidth} />
           <aside className="pane actions-pane" style={{ width: actionsWidth }}>
-            <Actions pr={pr} isAiOn={isAiOn} onReply={reply} onAddress={openAddress} onReview={openReview} onMerge={canMerge ? askMerge : null} />
+            <Actions pr={pr} isAiOn={isAiOn} onReply={reply} onAddress={openAddress} onReview={openReview} onMerge={canMerge ? askMerge : null} onSnooze={onSnooze} />
           </aside>
         </>
         )
