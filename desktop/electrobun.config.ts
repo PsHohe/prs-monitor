@@ -6,7 +6,7 @@ export default {
   app: {
     name: 'Team PRs',
     identifier: 'dev.prs-monitor.desktop',
-    version: '0.2.0',
+    version: '0.2.1',
   },
   build: {
     mainProcess: 'bun',
