@@ -145,7 +145,6 @@ export async function writeCache(path: string, cache: SharedCache): Promise<void
   }
 }
 
-// What the CLI remembers between runs; the plugin keeps its own copy in its plugin store.
 // The unresolved threads of the given PRs (repo#number keys), in one query of about 2 points per PR.
 export async function fetchThreadSummaries(keys: string[]): Promise<Record<string, PrThreads> | null> {
   const targets = keys.slice(0, 20).flatMap(key => {
@@ -208,10 +207,12 @@ export async function fetchThreadSummaries(keys: string[]): Promise<Record<strin
   return out
 }
 
+// What is remembered between runs. Named after the CLI this began as (archive/cli); the file keeps its name so
+// existing marks and snoozes survive. The plugin keeps its own copy in its plugin store.
 export type CliState = {
   seen: Record<string, string>
   collapsed: string[]
-  // Where each repo was last seen on disk (owner/name → root), so --all can read its config.
+  // Where each repo was last seen on disk (owner/name → root), so "All repos" can read its config.
   repos: Record<string, string>
   snoozed: Record<string, Snooze>
 }

@@ -20,7 +20,7 @@ import {
 import type { Config, GqlPr, PrThreads, RowOptions, SharedCache, Snooze } from './lib/lib'
 
 export type Scope = {
-  // The git repository the CLI runs in, if any.
+  // The git repository in scope, if any.
   root: string | null
   repo: string | null
   branch: string | null
@@ -76,7 +76,7 @@ export async function saveHomeSettings(values: Record<string, string>): Promise<
 }
 
 // The settings that apply to each repo's PRs: the home file plus the repo's own files when we know
-// where the repo is on disk. `current` is what applies to the repo the CLI runs in, or the home file.
+// where the repo is on disk. `current` is what applies to the repo in scope, or the home file.
 export type Configs = { home: Config; current: Config; byRepo: Record<string, Config> }
 
 export async function loadConfigs(scope: Scope, repos: Record<string, string>): Promise<Configs> {
@@ -124,7 +124,7 @@ export async function refresh(
   { maxAgeMs, canFetch }: RefreshOptions,
 ): Promise<Snapshot> {
   if (!scope.isAll && !scope.repo) {
-    return { ...EMPTY, error: scope.root ? 'this repository has no GitHub remote gh can read (try --all)' : 'not inside a git repository (try --all)' }
+    return { ...EMPTY, error: scope.root ? 'this repository has no GitHub remote gh can read (try All repos)' : 'not inside a git repository (try All repos)' }
   }
   const now = Date.now()
   const path = cachePath(scope.isAll ? null : scope.repo)

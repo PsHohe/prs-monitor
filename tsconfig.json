@@ -3,12 +3,11 @@
     "target": "ESNext",
     "module": "Preserve",
     "moduleResolution": "bundler",
-    "jsx": "react-jsx",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noEmit": true,
     "skipLibCheck": true,
     "types": ["bun"]
   },
-  "include": ["src", "tests", "scripts"]
+  "include": ["src", "tests"]
 }

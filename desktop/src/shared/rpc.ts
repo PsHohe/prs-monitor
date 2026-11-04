@@ -13,7 +13,7 @@ export type PrsRpc = {
     requests: {
       // force always asks GitHub; otherwise a cache under a minute old is used.
       refresh: { params: { force: boolean }; response: Snapshot }
-      // Marks and snoozes are saved where the CLI reads them too; each answers with the list as it leaves it, without asking GitHub.
+      // Marks and snoozes each answer with the list as they leave it, without asking GitHub.
       markSeen: { params: { pr: PrRow }; response: Snapshot }
       // until is when it comes back at the latest; new activity always brings it back.
       snooze: { params: { pr: PrRow; until: number | null }; response: Snapshot }
@@ -44,7 +44,7 @@ export type PrsRpc = {
       // The providers this app may use; none turns its AI features off.
       setProviders: { params: { providers: ReportProvider[] }; response: DesktopState }
       settings: { params: {}; response: Settings }
-      // Frontmatter keys for the home config file, shared with the CLI; an empty value removes the key.
+      // Frontmatter keys for the home config file; an empty value removes the key.
       saveSettings: { params: { values: Record<string, string> }; response: Settings | { failure: string } }
       // Starts writing the PR's AI report, replacing one already being written; the text arrives as report messages.
       startReport: { params: { pr: PrRow }; response: boolean }

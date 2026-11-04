@@ -2,7 +2,7 @@ import { ciChip, extraChips, reviewChip, threadsChip } from '../../../src/lib/li
 import type { Chip } from '../../../src/lib/lib'
 import type { PrRow } from '../../../src/types'
 
-// The terminal's legend, as tooltips; checked in order, so longer prefixes come first.
+// The chips' legend, as tooltips; checked in order, so longer prefixes come first.
 const TIPS: [string, string][] = [
   ['✓ CI', 'CI passing'],
   ['✗ CI~', 'Only checks marked flaky are failing'],

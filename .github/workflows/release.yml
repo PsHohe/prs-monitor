@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
-      # The app bundles the CLI's code from ../src, with its dependencies.
+      # The app bundles the core from ../src, with its dependencies.
       - run: bun install --frozen-lockfile
 
       - name: Install Hutch

@@ -7,7 +7,7 @@ import type { Scope } from '../../../src/monitor'
 import { parseDesktopState } from '../shared/repos'
 import type { DesktopState, RepoEntry } from '../shared/repos'
 
-// Next to the CLI's own state, which it does not touch.
+// Next to cli-state.json, which it does not touch.
 const PATH = join(homedir(), '.claude', 'pr-monitor', 'desktop.json')
 
 export async function readDesktopState(): Promise<DesktopState> {
@@ -36,7 +36,7 @@ export async function repoAt(folder: string): Promise<RepoEntry | { failure: str
   return repo ? { repo, root } : { failure: `gh cannot find a GitHub repository for ${root}` }
 }
 
-// Like the CLI run inside the clone: its branch's PR and its config files apply.
+// Scoped to the clone: its branch's PR and its config files apply.
 export async function scopeOf(entry: RepoEntry): Promise<Scope> {
   const branch = await run(['git', 'branch', '--show-current'], entry.root)
 
