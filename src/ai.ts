@@ -2,11 +2,10 @@ import { tmpdir } from 'node:os'
 
 import { query } from '@anthropic-ai/claude-agent-sdk'
 
-import type { PrRow } from './types'
 import { localOffset } from './actions'
 import { gh } from './github'
 import type { RunResult } from './github'
-import { DIGEST_SYSTEM, digestPrompt, REPORT_SYSTEM, reportPrompt } from './lib/lib'
+import { REPORT_SYSTEM, reportPrompt } from './lib/lib'
 import type { Config, ReportData, ReportDismissal } from './lib/lib'
 
 const REPORT_FIELDS =
@@ -50,18 +49,6 @@ export async function quickReport(
   }
 
   return complete(reportPrompt(data, config), REPORT_SYSTEM, config, { onText, signal })
-}
-
-// What to do first across the given PRs, from the rows alone (no extra GitHub calls).
-export function digest(
-  rows: PrRow[],
-  me: string,
-  config: Config,
-  options: { onText?: (soFar: string) => void; signal?: AbortSignal } = {},
-): Promise<ReportResult> {
-  const prompt = digestPrompt(rows, { me, now: Date.now(), offsetMinutes: localOffset() }, config.sections['digest focus'])
-
-  return complete(prompt, DIGEST_SYSTEM, config, options)
 }
 
 type Streaming = { onText?: (soFar: string) => void; signal?: AbortSignal }

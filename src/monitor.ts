@@ -253,7 +253,7 @@ async function threadDetails(
     return kept
   }
   const threads = { ...kept, ...fetched }
-  // Saved only onto the same fetch, so a newer one written meanwhile by another terminal is not overwritten.
+  // Saved only onto the same fetch, so a newer one written meanwhile by another process is not overwritten.
   const latest = await readCache(path)
   if (latest && latest.at === shared.at) {
     await writeCache(path, { ...latest, threads })

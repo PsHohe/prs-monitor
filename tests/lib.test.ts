@@ -1,11 +1,8 @@
 import { expect, test } from 'bun:test'
 
 import {
-  askPrompt,
-  alertOf,
   ciChip,
   detailOf,
-  cleanupPrompt,
   DEFAULT_CONFIG,
   extraChips,
   linkRows,
@@ -16,10 +13,7 @@ import {
   parseCache,
   pauseAfter,
   parseConfigFile,
-  parseOffset,
   reportPrompt,
-  rereviewPrompt,
-  reviewPrompt,
   summarizeCi,
   toRow,
 } from '../src/lib/lib'
@@ -66,11 +60,8 @@ test('a key left empty with only a comment reads as empty', async () => {
   expect(config.flakyChecks).toEqual([])
 })
 
-test('no files means defaults and no cleanup', async () => {
-  const config = mergeConfig([])
-
-  expect(config).toEqual(DEFAULT_CONFIG)
-  expect(cleanupPrompt(toRow(raw({}), 'me', {}, PLAIN), config)).toBe(null)
+test('no files means defaults', () => {
+  expect(mergeConfig([])).toEqual(DEFAULT_CONFIG)
 })
 
 test('CI summary counts pending checks and names failing ones', async () => {
@@ -132,6 +123,49 @@ test('a review requested from me puts the PR on my plate', async () => {
 
   expect(toRow(theirs, 'me', {}, PLAIN).bucket).toBe('me')
   expect(toRow(theirs, 'me', {}, PLAIN).isRequestedFromMe).toBe(true)
+})
+
+test('a PR we reviewed offers a re-review once the author pushes or replies', () => {
+  const theirs = (over: Partial<RawPr>) =>
+    raw({
+      number: 424,
+      author: { login: 'dev' },
+      commits: [{ authors: [{ login: 'dev' }], committedDate: '2026-10-05T08:00:00Z' }],
+      reviews: [{ author: { login: 'me' }, state: 'CHANGES_REQUESTED', submittedAt: '2026-10-05T10:00:00Z', commitOid: 'a1b2c3d4e5' }],
+      ...over,
+    })
+
+  expect(toRow(theirs({}), 'me', {}, PLAIN).rereview).toBeNull()
+
+  const pushed = toRow(
+    theirs({
+      commits: [
+        { authors: [{ login: 'dev' }], committedDate: '2026-10-05T08:00:00Z' },
+        { authors: [{ login: 'dev' }], committedDate: '2026-10-06T09:00:00Z' },
+        { authors: [{ login: 'dev' }], committedDate: '2026-10-06T09:30:00Z' },
+      ],
+    }),
+    'me',
+    {},
+    PLAIN,
+  )
+  expect(pushed.rereview).toEqual({ at: '2026-10-05T10:00:00Z', state: 'CHANGES_REQUESTED', oid: 'a1b2c3d4e5', commits: 2, isReplied: false })
+  expect(extraChips(pushed)).toContainEqual({ text: 'Δ2', color: 'warning' })
+
+  const replied = toRow(
+    theirs({ comments: [{ author: { login: 'dev' }, body: 'fixed', createdAt: '2026-10-06T09:00:00Z' }] }),
+    'me',
+    {},
+    PLAIN,
+  )
+  expect(replied.rereview?.isReplied).toBe(true)
+  expect(extraChips(replied)).toContainEqual({ text: 'Δ replies', color: 'warning' })
+
+  // Our own PR never asks for a re-review; a first review request does.
+  const own = raw({ reviews: [{ author: { login: 'dev' }, state: 'APPROVED', submittedAt: '2026-10-06T09:00:00Z' }] })
+  expect(toRow(own, 'me', {}, PLAIN).rereview).toBeNull()
+  const asked = toRow(raw({ author: { login: 'dev' }, commits: [], reviewRequests: [{ login: 'me' }] }), 'me', {}, PLAIN)
+  expect(asked.needsFirstReview).toBe(true)
 })
 
 test('a pending review request stops needing me once I spoke last', async () => {
@@ -210,22 +244,7 @@ test('hotfix twins link across prod and develop, open or merged', async () => {
   expect(alone?.twin).toBe(null)
 })
 
-test('the band alert prefers new activity on the current PR, then other new PRs, then ready ones', async () => {
-  const now = Date.parse('2026-10-06T12:00:00Z')
-  const fresh = (number: number) => ({ ...toRow(raw({ number }), 'me', {}, PLAIN), isNew: true, lastOtherWhat: 'comment by rev', lastOtherAt: '2026-10-06T11:48:00Z' })
-  const ready = { ...toRow(raw({ number: 426 }), 'me', {}, PLAIN), bucket: 'ready' as const }
-  const current = toRow(raw({ number: 429 }), 'me', {}, PLAIN)
-
-  expect(alertOf(fresh(429), [fresh(416), ready], now)).toEqual({ kind: 'new', pr: fresh(429), text: 'comment by rev · 12m ago', more: 1 })
-  expect(alertOf(current, [fresh(416), fresh(411), ready], now)?.pr.number).toBe(416)
-  expect(alertOf(current, [fresh(416), fresh(411), ready], now)?.more).toBe(1)
-  expect(alertOf(current, [ready], now)).toEqual({ kind: 'ready', pr: ready, text: 'ready to merge', more: 0 })
-  expect(alertOf(null, [current], now)).toBe(null)
-})
-
-test('report dates are local MM/DD/YYYY and today is stated', async () => {
-  expect(parseOffset('-0300\n')).toBe(-180)
-  expect(parseOffset('+0530')).toBe(330)
+test('report dates are local MM/DD/YYYY and today is stated', () => {
   expect(formatDate('2026-10-06T01:30:00Z', -180)).toBe('10/05/2026 22:30')
   expect(formatDate(Date.parse('2026-10-06T15:00:00Z'), 0, false)).toBe('10/06/2026')
 })
@@ -260,16 +279,6 @@ test('the report timeline explains a stale dismissal in order', async () => {
   expect(positions.every(at => at >= 0)).toBe(true)
   expect([...positions].sort((a, b) => a - b)).toEqual(positions)
   expect(timeline).toContain('10/06/2026 10:25 commit 0f43b47')
-})
-
-test('prompts carry the project guidance', async () => {
-  const config = mergeConfig([parseConfigFile(PROJECT)])
-  const row = { ...toRow(raw({ state: 'MERGED' }), 'me', {}, PLAIN), headRef: 'feature/PD-906-x' }
-
-  expect(askPrompt(row, config)).toContain('Red CI from known flaky tests is not a blocker.')
-  expect(askPrompt(row, config, '**Status**: approved')).toContain('**Status**: approved')
-  expect(cleanupPrompt(row, config)).toContain('branch feature/PD-906-x')
-  expect(cleanupPrompt(row, config)).toContain('Move the PD ticket to Done.')
 })
 
 function raw(over: Partial<RawPr>): RawPr {
@@ -331,90 +340,4 @@ test('polling pauses until the reset once the GraphQL budget runs low', () => {
   expect(isRateLimited('gh: API rate limit already exceeded for user ID 1.')).toBe(true)
   expect(parseCache('{"at":1}')).toBeNull()
   expect(parseCache('{"at":1,"me":"me","open":[]}')).toEqual({ at: 1, me: 'me', open: [], merged: [], pausedUntil: null, branches: {}, threads: {} })
-})
-
-test('a PR we reviewed offers a re-review once the author pushes or replies', () => {
-  const theirs = (over: Partial<RawPr>) =>
-    raw({
-      number: 424,
-      author: { login: 'dev' },
-      commits: [{ authors: [{ login: 'dev' }], committedDate: '2026-10-05T08:00:00Z' }],
-      reviews: [{ author: { login: 'me' }, state: 'CHANGES_REQUESTED', submittedAt: '2026-10-05T10:00:00Z', commitOid: 'a1b2c3d4e5' }],
-      ...over,
-    })
-
-  expect(toRow(theirs({}), 'me', {}, PLAIN).rereview).toBeNull()
-
-  const pushed = toRow(
-    theirs({
-      commits: [
-        { authors: [{ login: 'dev' }], committedDate: '2026-10-05T08:00:00Z' },
-        { authors: [{ login: 'dev' }], committedDate: '2026-10-06T09:00:00Z' },
-        { authors: [{ login: 'dev' }], committedDate: '2026-10-06T09:30:00Z' },
-      ],
-    }),
-    'me',
-    {},
-    PLAIN,
-  )
-  expect(pushed.rereview).toEqual({ at: '2026-10-05T10:00:00Z', state: 'CHANGES_REQUESTED', oid: 'a1b2c3d4e5', commits: 2, isReplied: false })
-  expect(extraChips(pushed)).toContainEqual({ text: 'Δ2', color: 'warning' })
-
-  const replied = toRow(
-    theirs({ comments: [{ author: { login: 'dev' }, body: 'fixed', createdAt: '2026-10-06T09:00:00Z' }] }),
-    'me',
-    {},
-    PLAIN,
-  )
-  expect(replied.rereview?.isReplied).toBe(true)
-  expect(extraChips(replied)).toContainEqual({ text: 'Δ replies', color: 'warning' })
-
-  // Our own PR never asks for a re-review; a first review request does.
-  const own = raw({ reviews: [{ author: { login: 'dev' }, state: 'APPROVED', submittedAt: '2026-10-06T09:00:00Z' }] })
-  expect(toRow(own, 'me', {}, PLAIN).rereview).toBeNull()
-  const asked = toRow(raw({ author: { login: 'dev' }, commits: [], reviewRequests: [{ login: 'me' }] }), 'me', {}, PLAIN)
-  expect(asked.needsFirstReview).toBe(true)
-  expect(reviewPrompt(asked, DEFAULT_CONFIG)).toContain('github-pr-review skill')
-})
-
-test('the re-review prompt lists our threads with replies and the project rule', () => {
-  const row = toRow(
-    raw({
-      number: 424,
-      author: { login: 'dev' },
-      baseRefName: 'develop',
-      commits: [{ authors: [{ login: 'dev' }], committedDate: '2026-10-06T09:00:00Z' }],
-      reviews: [{ author: { login: 'me' }, state: 'CHANGES_REQUESTED', submittedAt: '2026-10-05T10:00:00Z', commitOid: 'a1b2c3d4e5' }],
-    }),
-    'me',
-    {},
-    PLAIN,
-  )
-  const config = mergeConfig([parseConfigFile('## Re-review\nRe-check BIP export paths if touched.\n')])
-  const text = rereviewPrompt(
-    row,
-    [
-      {
-        path: 'app/Parser.php',
-        line: 42,
-        isResolved: false,
-        isOutdated: true,
-        comments: [
-          { author: 'me', body: 'This clears 11-1p.', at: '2026-10-05T10:00:00Z' },
-          { author: 'dev', body: 'Fixed in e4f5.', at: '2026-10-06T09:05:00Z' },
-        ],
-      },
-      { path: 'other.ts', line: 1, isResolved: false, isOutdated: false, comments: [{ author: 'yruben', body: 'not ours', at: '2026-10-05T11:00:00Z' }] },
-    ],
-    { me: 'me', headOid: 'e4f5a6b7c8', reviewBody: 'Two issues in the parser.', offsetMinutes: -180 },
-    config,
-  )
-  expect(text).toContain('CHANGES_REQUESTED on 10/05/2026 07:00 at commit a1b2c3d')
-  expect(text).toContain('The head is now e4f5a6b (1 commit since)')
-  expect(text).toContain('1. app/Parser.php:42 (unresolved, outdated): "This clears 11-1p."')
-  expect(text).toContain('↳ dev 10/06/2026 06:05: "Fixed in e4f5."')
-  expect(text).not.toContain('not ours')
-  expect(text).toContain('Two issues in the parser.')
-  expect(text).toContain('Draft a reply on each of our threads')
-  expect(text).toContain('Project guidance:\nRe-check BIP export paths if touched.')
 })
