@@ -2,11 +2,10 @@ import { tmpdir } from 'node:os'
 
 import { query } from '@anthropic-ai/claude-agent-sdk'
 
-import type { PrRow } from './types'
 import { localOffset } from './actions'
 import { gh } from './github'
 import type { RunResult } from './github'
-import { DIGEST_SYSTEM, digestPrompt, REPORT_SYSTEM, reportPrompt } from './lib/lib'
+import { REPORT_SYSTEM, reportPrompt } from './lib/lib'
 import type { Config, ReportData, ReportDismissal } from './lib/lib'
 
 const REPORT_FIELDS =
@@ -52,18 +51,6 @@ export async function quickReport(
   return complete(reportPrompt(data, config), REPORT_SYSTEM, config, { onText, signal })
 }
 
-// What to do first across the given PRs, from the rows alone (no extra GitHub calls).
-export function digest(
-  rows: PrRow[],
-  me: string,
-  config: Config,
-  options: { onText?: (soFar: string) => void; signal?: AbortSignal } = {},
-): Promise<ReportResult> {
-  const prompt = digestPrompt(rows, { me, now: Date.now(), offsetMinutes: localOffset() }, config.sections['digest focus'])
-
-  return complete(prompt, DIGEST_SYSTEM, config, options)
-}
-
 type Streaming = { onText?: (soFar: string) => void; signal?: AbortSignal }
 
 // One plain answer from the configured provider.
@@ -97,9 +84,9 @@ async function completeClaude(
         maxTurns: 1,
         includePartialMessages: true,
         cwd: tmpdir(),
-        // The installed CLI, so a compiled prs works without the SDK's bundled copy.
+        // The installed Claude Code, so the packaged app works without the SDK's bundled copy.
         pathToClaudeCodeExecutable: Bun.which('claude') ?? undefined,
-        // Label the requests as ours, not as the Claude Code session prs may have been started from.
+        // Label the requests as ours, not as the Claude Code session the app may have been started from.
         env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: 'prs-monitor' },
         abortController,
       },

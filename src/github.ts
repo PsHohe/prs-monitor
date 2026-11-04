@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path'
 
 import type { PrRow } from './types'
 import { isRateLimited, parseCache } from './lib/lib'
-import type { ChangesData, Conversation, GqlPr, MergedPr, PrThreads, SharedCache, Snooze, TeamPr, ThreadDetail, ThreadSummary } from './lib/lib'
+import type { Conversation, GqlPr, MergedPr, PrThreads, SharedCache, Snooze, ThreadDetail, ThreadSummary } from './lib/lib'
 
 export type RunResult = { exitCode: number; stdout: string; stderr: string }
 
@@ -145,7 +145,6 @@ export async function writeCache(path: string, cache: SharedCache): Promise<void
   }
 }
 
-// What the CLI remembers between runs; the plugin keeps its own copy in its plugin store.
 // The unresolved threads of the given PRs (repo#number keys), in one query of about 2 points per PR.
 export async function fetchThreadSummaries(keys: string[]): Promise<Record<string, PrThreads> | null> {
   const targets = keys.slice(0, 20).flatMap(key => {
@@ -208,10 +207,12 @@ export async function fetchThreadSummaries(keys: string[]): Promise<Record<strin
   return out
 }
 
+// What is remembered between runs. Named after the CLI this began as (archive/cli); the file keeps its name so
+// existing marks and snoozes survive. The plugin keeps its own copy in its plugin store.
 export type CliState = {
   seen: Record<string, string>
   collapsed: string[]
-  // Where each repo was last seen on disk (owner/name → root), so --all can read its config.
+  // Where each repo was last seen on disk (owner/name → root), so "All repos" can read its config.
   repos: Record<string, string>
   snoozed: Record<string, Snooze>
 }
@@ -234,7 +235,7 @@ export async function readState(): Promise<CliState> {
   }
 }
 
-// Merged over the file, so what another terminal saved meanwhile is kept. A null snooze removes it.
+// Merged over the file, so what another process saved meanwhile is kept. A null snooze removes it.
 export async function updateState(patch: Partial<Omit<CliState, 'snoozed'>> & { snoozed?: Record<string, Snooze | null> }): Promise<CliState> {
   const stored = await readState()
   const snoozed = { ...stored.snoozed }
@@ -323,49 +324,6 @@ export async function fetchThreads(repo: string, number: number): Promise<Thread
   }
 }
 
-// Commits and files since my last review, for the changes view. Fetched only when asked.
-export async function fetchChanges(pr: PrRow, offsetMinutes: number): Promise<ChangesData | { failure: string }> {
-  const since = pr.rereview
-  if (!since) {
-    return { failure: 'No review of mine to compare against' }
-  }
-  const [owner = '', name = ''] = pr.repo.split('/')
-  const query = `query($owner: String!, $name: String!, $number: Int!) {
-    repository(owner: $owner, name: $name) { pullRequest(number: $number) {
-      headRefOid
-      commits(last: 100) { nodes { commit { oid messageHeadline committedDate parents { totalCount } author { name user { login } } } } }
-    } }
-  }`
-  const result = await gh(['api', 'graphql', '-f', `query=${query}`, '-f', `owner=${owner}`, '-f', `name=${name}`, '-F', `number=${pr.number}`])
-  if (result.exitCode !== 0) {
-    return { failure: result.stderr.trim() || 'gh api graphql failed' }
-  }
-  type Node = { commit: { oid: string; messageHeadline: string; committedDate: string; parents: { totalCount: number }; author: { name?: string; user: { login?: string } | null } | null } }
-  const data = (JSON.parse(result.stdout) as { data: { repository: { pullRequest: { headRefOid: string; commits: { nodes: Node[] } } } } }).data.repository.pullRequest
-  const commits = data.commits.nodes.map(({ commit }) => ({
-    oid: commit.oid,
-    headline: commit.messageHeadline,
-    author: commit.author?.user?.login ?? commit.author?.name ?? 'someone',
-    at: commit.committedDate,
-    isMerge: commit.parents.totalCount > 1,
-  }))
-
-  let files: ChangesData['files'] = null
-  if (since.oid) {
-    const [compared, prFiles] = await Promise.all([
-      gh(['api', `repos/${pr.repo}/compare/${since.oid}...${data.headRefOid}`, '--jq', '.files[] | {path: .filename, status, additions, deletions}']),
-      gh(['api', `repos/${pr.repo}/pulls/${pr.number}/files`, '--paginate', '--jq', '.[].filename']),
-    ])
-    if (compared.exitCode === 0) {
-      files = compared.stdout.split('\n').filter(Boolean).map(line => JSON.parse(line) as NonNullable<ChangesData['files']>[number])
-    }
-
-    return { pr, since: { at: since.at, oid: since.oid }, commits, files, prFiles: prFiles.stdout.split('\n').filter(Boolean), offsetMinutes }
-  }
-
-  return { pr, since: { at: since.at, oid: since.oid }, commits, files, prFiles: [], offsetMinutes }
-}
-
 // The PR's description and whole discussion, for the PR view. Fetched only when asked, about 1 point.
 const CONVERSATION_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -435,23 +393,6 @@ export async function mergePr(pr: PrRow, method: 'merge' | 'squash' | 'rebase'):
   return done(await gh(['pr', 'merge', String(pr.number), '--repo', pr.repo, `--${method}`]), `Merged #${pr.number} into ${pr.baseRef}`)
 }
 
-export async function updateBranch(pr: PrRow): Promise<Done> {
-  return done(await gh(['pr', 'update-branch', String(pr.number), '--repo', pr.repo]), `Updated #${pr.number} with ${pr.baseRef}`)
-}
-
-export async function checkoutPr(pr: PrRow, root: string): Promise<Done> {
-  return done(await gh(['pr', 'checkout', String(pr.number)], root), `Checked out #${pr.number} (${pr.headRef})`)
-}
-
-export async function rerequestReview(pr: PrRow, logins: string[]): Promise<Done> {
-  const reviewers = logins.flatMap(login => ['-f', `reviewers[]=${login}`])
-
-  return done(
-    await gh(['api', '-X', 'POST', `repos/${pr.repo}/pulls/${pr.number}/requested_reviewers`, ...reviewers, '--silent']),
-    `Asked ${logins.join(', ')} to review #${pr.number} again`,
-  )
-}
-
 export async function replyToThread(threadId: string, body: string): Promise<Done> {
   const query = 'mutation($id: ID!, $body: String!) { addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $id, body: $body }) { comment { id } } }'
 
@@ -493,70 +434,4 @@ export async function resolveThread(threadId: string): Promise<Done> {
   const query = 'mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { isResolved } } }'
 
   return done(await gh(['api', 'graphql', '-f', `query=${query}`, '-f', `id=${threadId}`]), 'Thread resolved')
-}
-
-// Every open PR in the given repos, with who is asked to review it and since when, for the team view: about 3 points.
-const TEAM_QUERY = `query($q: String!) {
-  search(query: $q, type: ISSUE, first: 100) { nodes { ... on PullRequest {
-    number title isDraft createdAt author { __typename login } repository { nameWithOwner }
-    reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on User { login } ... on Team { slug } } } }
-    timelineItems(itemTypes: [REVIEW_REQUESTED_EVENT], last: 20) { nodes { ... on ReviewRequestedEvent {
-      createdAt requestedReviewer { ... on User { login } ... on Team { slug } }
-    } } }
-    reviews(last: 50) { nodes { author { __typename login } state submittedAt } }
-  } } }
-}`
-
-type TeamNode = {
-  number?: number
-  title: string
-  isDraft: boolean
-  createdAt: string
-  author: { __typename: string; login: string } | null
-  repository: { nameWithOwner: string }
-  reviewRequests: { nodes: { requestedReviewer: { __typename: string; login?: string; slug?: string } | null }[] }
-  timelineItems: { nodes: { createdAt?: string; requestedReviewer?: { login?: string; slug?: string } | null }[] }
-  reviews: { nodes: { author: { __typename: string; login: string } | null; state: string; submittedAt: string }[] }
-}
-
-export async function fetchTeam(repos: string[]): Promise<TeamPr[] | { failure: string }> {
-  if (repos.length === 0) {
-    return { failure: 'No repository to look at' }
-  }
-  const query = `is:pr is:open ${repos.map(one => `repo:${one}`).join(' ')}`
-  const result = await gh(['api', 'graphql', '-f', `query=${TEAM_QUERY}`, '-f', `q=${query}`])
-  if (result.exitCode !== 0) {
-    return { failure: result.stderr.trim() || 'gh api graphql failed' }
-  }
-  const nodes = (JSON.parse(result.stdout) as { data: { search: { nodes: TeamNode[] } } }).data.search.nodes
-  // Bots neither review nor need reviewers chased; teams show as @slug.
-  const who = (one: { __typename?: string; login?: string; slug?: string } | null | undefined) =>
-    !one || one.__typename === 'Bot' ? null : one.slug ? `@${one.slug}` : (one.login ?? null)
-
-  return nodes
-    .filter(node => typeof node.number === 'number' && who(node.author))
-    .map(node => {
-      const asked = node.timelineItems.nodes
-      const requested = node.reviewRequests.nodes.flatMap(({ requestedReviewer }) => {
-        const login = who(requestedReviewer)
-        const event = asked.filter(one => who(one.requestedReviewer) === login).at(-1)
-
-        return login ? [{ login, at: event?.createdAt ?? node.createdAt }] : []
-      })
-
-      return {
-        repo: node.repository.nameWithOwner,
-        number: node.number as number,
-        title: node.title,
-        author: who(node.author) as string,
-        isDraft: node.isDraft,
-        createdAt: node.createdAt,
-        requested,
-        reviews: node.reviews.nodes.flatMap(review => {
-          const login = who(review.author)
-
-          return login ? [{ login, state: review.state, at: review.submittedAt }] : []
-        }),
-      }
-    })
 }

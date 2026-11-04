@@ -45,7 +45,7 @@ let latest: { me: string; scope: Scope; configs: Configs } | null = null
 // Bumped when the active repo changes, so a poll that started before does not show the old repo's PRs.
 let generation = 0
 
-// The active repo as if the CLI ran in its clone; with none, every repo involving me (like --all).
+// The active repo, scoped to its clone; with none, every repo involving me.
 async function load(maxAgeMs: number): Promise<Snapshot> {
   const [state, desktop] = await Promise.all([readState(), readDesktopState()])
   const entry = desktop.repos.find(one => one.repo === desktop.active)
@@ -119,7 +119,7 @@ async function addRepo(): Promise<DesktopState | { failure: string } | null> {
   }
   const next = withRepo(await readDesktopState(), entry)
   await writeDesktopState(next)
-  // The CLI's map of clones, which "All repos" reads each repo's config through.
+  // The map of clones in cli-state.json, which "All repos" reads each repo's config through.
   await updateState({ repos: { [entry.repo]: entry.root } })
   generation++
 
@@ -659,7 +659,7 @@ window.on('will-close', event => {
 
 showTray((await readDesktopState()).keepInTray === true)
 
-// Same cadence as the TUI; the shared cache keeps the CLI and this app from asking GitHub twice.
+// The configured poll_interval; the shared cache keeps the plugin and this app from asking GitHub twice.
 const pollMs = (await loadConfig(null)).pollMinutes * 60 * 1000
 setInterval(() => void pushSnapshot(pollMs), pollMs)
 

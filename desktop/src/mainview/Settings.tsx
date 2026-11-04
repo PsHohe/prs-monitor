@@ -5,7 +5,7 @@ import type { ReportProvider } from '../../../src/lib/lib'
 import type { Settings } from '../shared/rpc'
 import { bun } from './bridge'
 
-// The CLI's own list; a model typed into the file by hand is kept as a choice.
+// A model typed into the file by hand is kept as a choice.
 const CLAUDE_MODELS = ['sonnet', 'opus', 'haiku', 'fable']
 const PROVIDER_NAMES: Record<ReportProvider, string> = { claude: 'Claude', codex: 'Codex' }
 
@@ -124,8 +124,7 @@ export function SettingsSheet({ providers, isAutoReport, onProviders, onAutoRepo
               )}
               {settings.provider !== settings.savedProvider && (
                 <p className="hint warning">
-                  {PROVIDER_NAMES[settings.savedProvider]} is turned off here, so this app uses {PROVIDER_NAMES[settings.provider]}; the prs CLI
-                  still uses {PROVIDER_NAMES[settings.savedProvider]}.
+                  {PROVIDER_NAMES[settings.savedProvider]} is turned off here, so this app uses {PROVIDER_NAMES[settings.provider]}.
                 </p>
               )}
 
@@ -177,7 +176,7 @@ export function SettingsSheet({ providers, isAutoReport, onProviders, onAutoRepo
                 The AI review reads the PR and its code, so it gets its own Claude model; with Codex it uses the Codex model above, at this
                 effort (max is xhigh there). More effort thinks longer: slower, costlier and more thorough.
               </p>
-              <p className="hint">These are saved to {settings.path}, which the prs CLI uses too.</p>
+              <p className="hint">These are saved to {settings.path}.</p>
             </>
           ) : (
             !failure && <p className="hint">Loading…</p>
